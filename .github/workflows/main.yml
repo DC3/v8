@@ -4,6 +4,11 @@ on:
     types:
       - published
 
+# Default GITHUB_TOKEN on a fork is read-only → release-asset upload fails with
+# "Resource not accessible by integration". Grant write so gh release upload works.
+permissions:
+  contents: write
+
 env:
   V8_VERSION: "14.9"
 
@@ -43,42 +48,32 @@ jobs:
           tar -zcvf ../src.tar.gz src
           gzip -9 -c out.gn/linux.${{ matrix.platform }}.release/obj/libv8_monolith.a > ../libv8_monolith-linux-${{ matrix.platform }}.a.gz
           tar -zcvf ../gen-linux-${{ matrix.platform }}.tar.gz out.gn/linux.${{ matrix.platform }}.release/gen
-      - name: Upload headers
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+      # Fallback FIRST: capture the ~1h build as a workflow artifact regardless of
+      # whether the release upload below succeeds — so a build is never lost to an
+      # upload/permission failure again (the 2026-06-15 incident).
+      - name: Upload build as workflow artifact (fallback)
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ${{ github.workspace }}/include.tar.gz
-          asset_name: include.tar.gz
-          asset_content_type: application/gzip
-      - name: Upload source
-        uses: actions/upload-release-asset@v1
+          name: v8-linux-${{ matrix.platform }}
+          path: |
+            ${{ github.workspace }}/include.tar.gz
+            ${{ github.workspace }}/src.tar.gz
+            ${{ github.workspace }}/libv8_monolith-linux-${{ matrix.platform }}.a.gz
+            ${{ github.workspace }}/gen-linux-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+      # Modern, idempotent release upload (actions/upload-release-asset@v1 is
+      # archived). Needs the top-level permissions: contents: write.
+      - name: Upload release assets
         env:
-          GITHUB_TOKEN: ${{ github.token }}
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ${{ github.workspace }}/src.tar.gz
-          asset_name: src.tar.gz
-          asset_content_type: application/gzip
-      - name: Upload static library
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ${{ github.workspace }}/libv8_monolith-linux-${{ matrix.platform }}.a.gz
-          asset_name: libv8_monolith-linux-${{ matrix.platform }}.a.gz
-          asset_content_type: application/gzip
-      - name: Upload generated source
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ${{ github.workspace }}/gen-linux-${{ matrix.platform }}.tar.gz
-          asset_name: gen-linux-${{ matrix.platform }}.tar.gz
-          asset_content_type: application/gzip
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "${{ github.workspace }}/include.tar.gz" \
+            "${{ github.workspace }}/src.tar.gz" \
+            "${{ github.workspace }}/libv8_monolith-linux-${{ matrix.platform }}.a.gz" \
+            "${{ github.workspace }}/gen-linux-${{ matrix.platform }}.tar.gz" \
+            --repo "${{ github.repository }}" --clobber
 
   build-mac:
     if: ${{ false }}  # disabled — linux x64 only (lo-bun)

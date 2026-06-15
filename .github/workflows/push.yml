@@ -1,5 +1,9 @@
-name: build and publish v8 libs
-on: [push]
+name: build v8 libs (manual test build)
+# Manual-only: `on: [push]` fired a ~1h build on every push (incl. the release
+# tag push, duplicating main.yml). Releases publish assets via main.yml; use this
+# for an ad-hoc test build (uploads a workflow artifact).
+on:
+  workflow_dispatch:
 
 env:
   V8_VERSION: "14.9"
