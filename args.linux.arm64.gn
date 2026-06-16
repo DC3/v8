@@ -1,6 +1,6 @@
 clang_use_chrome_plugins=false
 dcheck_always_on=false
-enable_rust=false
+enable_rust=true
 is_clang=true
 is_component_build=false
 is_debug=false
@@ -20,7 +20,7 @@ icu_use_data_file=false
 v8_enable_pointer_compression=false
 v8_enable_sandbox=false
 v8_enable_snapshot_compression=false
-v8_enable_temporal_support=false  # temporal_capi is Rust; needs enable_rust — deferred, see lo-bun TODO
+v8_enable_temporal_support=true  # Temporal (Rust temporal_capi; needs enable_rust + .gclient checkout_rust)
 v8_enable_test_features=false
 v8_imminent_deprecation_warnings=false
 v8_monolithic=true

@@ -35,6 +35,9 @@ jobs:
           export PATH="$GITHUB_WORKSPACE/depot_tools:${PATH}"
           gclient
           fetch v8
+          # Temporal needs V8's Rust toolchain — opt in via the v8 solution's
+          # custom_vars (gclient sync has no --custom-var flag). Inject before sync.
+          python3 -c "p='$GITHUB_WORKSPACE/.gclient'; ns={}; exec(open(p).read(),ns); [s.setdefault('custom_vars',{}).update({'checkout_rust':True}) for s in ns.get('solutions',[]) if s.get('name')=='v8']; open(p,'w').write(''.join('%s = %r\n'%(k,ns[k]) for k in ns if not k.startswith('__')))"
           cd ${{ github.workspace }}/v8
           git checkout branch-heads/$V8_VERSION
           gclient sync
@@ -48,6 +51,12 @@ jobs:
           tar -zcvf ../src.tar.gz src
           gzip -9 -c out.gn/linux.${{ matrix.platform }}.release/obj/libv8_monolith.a > ../libv8_monolith-linux-${{ matrix.platform }}.a.gz
           tar -zcvf ../gen-linux-${{ matrix.platform }}.tar.gz out.gn/linux.${{ matrix.platform }}.release/gen
+          # Temporal: the Rust temporal_rs/temporal_capi + gn local_rustc_sysroot std
+          # are .rlib NOT bundled in the monolith — package them so lo-bun can link
+          # them (rust-rlibs.rsp). Paths relative to v8/ so they extract back in place.
+          find out.gn/linux.${{ matrix.platform }}.release/obj -name '*.rlib' > /tmp/rlibs.txt
+          find out.gn/linux.${{ matrix.platform }}.release/local_rustc_sysroot -name '*.rlib' >> /tmp/rlibs.txt
+          tar -zcvf ../rust-rlibs-linux-${{ matrix.platform }}.tar.gz -T /tmp/rlibs.txt
       # Fallback FIRST: capture the ~1h build as a workflow artifact regardless of
       # whether the release upload below succeeds — so a build is never lost to an
       # upload/permission failure again (the 2026-06-15 incident).
@@ -61,6 +70,7 @@ jobs:
             ${{ github.workspace }}/src.tar.gz
             ${{ github.workspace }}/libv8_monolith-linux-${{ matrix.platform }}.a.gz
             ${{ github.workspace }}/gen-linux-${{ matrix.platform }}.tar.gz
+            ${{ github.workspace }}/rust-rlibs-linux-${{ matrix.platform }}.tar.gz
           if-no-files-found: error
       # Modern, idempotent release upload (actions/upload-release-asset@v1 is
       # archived). Needs the top-level permissions: contents: write.
@@ -73,6 +83,7 @@ jobs:
             "${{ github.workspace }}/src.tar.gz" \
             "${{ github.workspace }}/libv8_monolith-linux-${{ matrix.platform }}.a.gz" \
             "${{ github.workspace }}/gen-linux-${{ matrix.platform }}.tar.gz" \
+            "${{ github.workspace }}/rust-rlibs-linux-${{ matrix.platform }}.tar.gz" \
             --repo "${{ github.repository }}" --clobber
 
   build-mac:
