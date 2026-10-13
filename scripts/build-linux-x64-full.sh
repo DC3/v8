@@ -86,8 +86,14 @@ test -x "$task_gn"
   "$task_gn" gen out.gn/linux.x64.release
   "$task_gn" args out.gn/linux.x64.release --list --short > "$task_info/gn-effective-args.txt"
   "$task_gn" desc out.gn/linux.x64.release //:v8_monolith defines > "$task_info/monolith-defines.txt"
+  # Compile the namespace port first; the full build reuses these same objects.
   timeout --signal=TERM --kill-after=30s 270m \
-    "$task_ninja" -j2 -C out.gn/linux.x64.release v8_monolith cctest v8_unittests
+    bash -e -u -o pipefail -c '
+      "$1" -j2 -C out.gn/linux.x64.release \
+        obj/v8_base_without_compiler/builtins-object.o \
+        obj/v8_base_without_compiler/module.o
+      "$1" -j2 -C out.gn/linux.x64.release v8_monolith cctest v8_unittests
+    ' -- "$task_ninja"
 )
 df -h "$task_work"
 

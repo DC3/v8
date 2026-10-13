@@ -90,7 +90,7 @@ index 7677d9c3..ec5f2064 100644
 +  DirectHandle<Object> marker = JSReceiver::GetDataProperty(
 +      isolate, Cast<JSModuleNamespace>(receiver),
 +      isolate->factory()->bun_module_namespace_marker_symbol());
-+  if (IsTrue(*marker, isolate)) return ReadOnlyRoots(isolate).true_value();
++  if (IsTrue(*marker)) return ReadOnlyRoots(isolate).true_value();
 +  return ReadOnlyRoots(isolate).undefined_value();
 +}
 +
@@ -367,7 +367,7 @@ index 1865ea0a..31453497 100644
 +  // namespaces. The existing context map caches the shared isolated prototype.
 +  if (v8_flags.bun_module_namespace_marker &&
 +      phase == ModuleImportPhase::kEvaluation &&
-+      IsNull(isolate->js_module_namespace_map()->prototype(), isolate)) {
++      IsNull(isolate->js_module_namespace_map()->prototype())) {
 +    Factory* factory = isolate->factory();
 +    DirectHandle<JSObject> prototype = factory->NewSlowJSObjectWithNullProto();
 +    auto make_accessor = [&](const char* name, Builtin builtin, int length) {
@@ -408,7 +408,7 @@ index 1865ea0a..31453497 100644
 +        PropertyDetails(
 +            PropertyKind::kData,
 +            static_cast<PropertyAttributes>(DONT_ENUM | DONT_DELETE),
-+            PropertyCellType::kMutable));
++            PropertyCellType::kMutable)).Check();
 +  }
    JSObject::PreventExtensions(isolate, ns, kThrowOnError).ToChecked();
  
