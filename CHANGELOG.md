@@ -1,5 +1,10 @@
 # 变更记录
 
+## [2026-10-13] 修正手动构建的 Ninja 选择
+
+- 首轮 CI38351053324 在 Ninja 版本检查失败：depot_tools 的未 bootstrap 包装脚本遮住 runner 工具，尚未进入 GN/V8 编译；保留原失败记录。
+- 调整 PATH 前固定 runner 原 Ninja 路径，构建与版本检查使用同一工具；V8/Clang/Rust、补丁、能力配置与27项门禁保持。
+
 ## [2026-10-13] 固定 V8 15.3 Linux x64 full seed 手动构建
 
 - 手动 workflow 固定 V8 15.3.76.24 源码与 depot_tools revision，在 Ubuntu 24.04 使用 bundled Clang/Rust；三份补丁按明确顺序应用。

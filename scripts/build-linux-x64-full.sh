@@ -12,6 +12,9 @@ readonly task_out="$task_source/out.gn/linux.x64.release"
 readonly task_seed="$task_work/seed"
 readonly task_info="$task_seed/v8/build-info"
 readonly task_artifact="$task_repo/artifacts/v8-linux-x64-$task_version-full.tar.gz"
+# Keep the runner's Ninja; depot_tools also ships a bootstrap-dependent wrapper.
+readonly task_ninja="$(command -v ninja)"
+test -x "$task_ninja"
 test ! -e "$task_work"
 test ! -e "$task_artifact"
 mkdir -p "$task_work" "$task_info" "$(dirname "$task_artifact")"
@@ -76,7 +79,7 @@ test -x "$task_gn"
   "$task_clang/ld.lld" --version
   "$task_rust" --version
   "$task_gn" --version
-  ninja --version
+  "$task_ninja" --version
 } | tee "$task_info/build-info.txt"
 (
   cd "$task_source"
@@ -84,7 +87,7 @@ test -x "$task_gn"
   "$task_gn" args out.gn/linux.x64.release --list --short > "$task_info/gn-effective-args.txt"
   "$task_gn" desc out.gn/linux.x64.release //:v8_monolith defines > "$task_info/monolith-defines.txt"
   timeout --signal=TERM --kill-after=30s 270m \
-    ninja -j2 -C out.gn/linux.x64.release v8_monolith cctest v8_unittests
+    "$task_ninja" -j2 -C out.gn/linux.x64.release v8_monolith cctest v8_unittests
 )
 df -h "$task_work"
 
