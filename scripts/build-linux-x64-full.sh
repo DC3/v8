@@ -62,7 +62,8 @@ PY
 for task_patch in \
   bun-module-namespace.patch \
   guarded-osr-context.patch \
-  15.3-cfunctioninfo-has-receiver-kno.patch; do
+  15.3-cfunctioninfo-has-receiver-kno.patch \
+  15.3-maglev-bounded-native-leaf.patch; do
   git -C "$task_source" apply --check "$task_repo/patches/$task_patch"
   git -C "$task_source" apply "$task_repo/patches/$task_patch"
 done
@@ -135,6 +136,11 @@ for task_case in TerminateOnlyV8ThreadFromOtherThread TerminateFromOtherThreadWh
   task_native_count=$((task_native_count + 1))
 done
 test "$task_native_count" -eq 27
+for task_case in \
+  FastApiBoundedNativeMaglev FastApiBoundedNativeMaglevDeopt FastApiBoundedNativeMaglevTermination; do
+  run_cctest "test-api/$task_case"
+done
+test "$task_native_count" -eq 30
 printf 'TOTAL_PASS=%s\n' "$task_native_count" >> "$task_info/native-gates.txt"
 
 # Existing seed paths: the rsp is interpreted from the consumer seed root.

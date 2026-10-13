@@ -1,0 +1,748 @@
+diff --git a/include/v8-fast-api-calls.h b/include/v8-fast-api-calls.h
+index 52fe1cb2..81a6bfd6 100644
+--- a/include/v8-fast-api-calls.h
++++ b/include/v8-fast-api-calls.h
+@@ -322,15 +322,28 @@ class V8_EXPORT CFunctionInfo {
+     kNo = 1,
+   };
+ 
++  // An explicit embedder contract for audited, statically linked private
++  // callees (including their adapters). The call must return in bounded time,
++  // without blocking, accessing V8, allocating in V8, reentering JavaScript,
++  // handling interrupts, unlocking the isolate, throwing, or unwinding across
++  // the call. This does NOT promise purity or the absence of memory writes.
++  // The default retains the ordinary Fast API semantics.
++  enum class NativeCallContract : uint8_t {
++    kDefault = 0,
++    kBoundedNoVM = 1,
++  };
++
+   // Construct a struct to hold a CFunction's type information.
+   // |return_info| describes the function's return type.
+   // |arg_info| is an array of |arg_count| CTypeInfos describing the
+   //   arguments. Only the last argument may be of the special type
+   //   CTypeInfo::kCallbackOptionsType.
+-  CFunctionInfo(const CTypeInfo& return_info, unsigned int arg_count,
+-                const CTypeInfo* arg_info,
+-                Int64Representation repr = Int64Representation::kNumber,
+-                HasReceiver has_receiver = HasReceiver::kYes);
++  CFunctionInfo(
++      const CTypeInfo& return_info, unsigned int arg_count,
++      const CTypeInfo* arg_info,
++      Int64Representation repr = Int64Representation::kNumber,
++      HasReceiver has_receiver = HasReceiver::kYes,
++      NativeCallContract native_call_contract = NativeCallContract::kDefault);
+ 
+   const CTypeInfo& ReturnInfo() const { return return_info_; }
+ 
+@@ -345,6 +358,10 @@ class V8_EXPORT CFunctionInfo {
+   // See the HasReceiver comment above.
+   bool HasReceiverArg() const { return has_receiver_ == HasReceiver::kYes; }
+ 
++  NativeCallContract GetNativeCallContract() const {
++    return native_call_contract_;
++  }
++
+   // |index| must be less than ArgumentCount().
+   //  Note: if the last argument passed on construction of CFunctionInfo
+   //  has type CTypeInfo::kCallbackOptionsType, it is not included in
+@@ -361,6 +378,7 @@ class V8_EXPORT CFunctionInfo {
+   const CTypeInfo return_info_;
+   const Int64Representation repr_;
+   const HasReceiver has_receiver_;
++  const NativeCallContract native_call_contract_;
+   const unsigned int arg_count_;
+   const CTypeInfo* arg_info_;
+ };
+diff --git a/src/api/api.cc b/src/api/api.cc
+index 61da1c48..6feff367 100644
+--- a/src/api/api.cc
++++ b/src/api/api.cc
+@@ -12239,11 +12239,12 @@ CFunction::CFunction(const void* address, const CFunctionInfo* type_info)
+ 
+ CFunctionInfo::CFunctionInfo(const CTypeInfo& return_info,
+                              unsigned int arg_count, const CTypeInfo* arg_info,
+-                             Int64Representation repr,
+-                             HasReceiver has_receiver)
++                             Int64Representation repr, HasReceiver has_receiver,
++                             NativeCallContract native_call_contract)
+     : return_info_(return_info),
+       repr_(repr),
+       has_receiver_(has_receiver),
++      native_call_contract_(native_call_contract),
+       arg_count_(arg_count),
+       arg_info_(arg_info) {
+   DCHECK(repr == Int64Representation::kNumber ||
+diff --git a/src/compiler/turboshaft/turbolev-graph-builder.cc b/src/compiler/turboshaft/turbolev-graph-builder.cc
+index 7e33f630..7900a476 100644
+--- a/src/compiler/turboshaft/turbolev-graph-builder.cc
++++ b/src/compiler/turboshaft/turbolev-graph-builder.cc
+@@ -1644,6 +1644,14 @@ class GraphBuildingNodeProcessor {
+     return ProcessJSBuiltinCall(node, builtin, callee, frame_state);
+   }
+ 
++#if defined(V8_TARGET_ARCH_X64) && V8_OS_LINUX && !defined(USE_SIMULATOR)
++  maglev::ProcessResult Process(maglev::CallBoundedNative* node,
++                                const maglev::ProcessingState& state) {
++    // MaglevGraphBuilder explicitly excludes this node in Turbolev mode.
++    UNREACHABLE();
++  }
++#endif
++
+   maglev::ProcessResult Process(maglev::CallKnownApiFunction* node,
+                                 const maglev::ProcessingState& state) {
+     GET_FRAME_STATE_MAYBE_ABORT(frame_state, node->lazy_deopt_info());
+diff --git a/src/maglev/maglev-graph-builder.cc b/src/maglev/maglev-graph-builder.cc
+index 88ede661..6831d2a2 100644
+--- a/src/maglev/maglev-graph-builder.cc
++++ b/src/maglev/maglev-graph-builder.cc
+@@ -11,6 +11,7 @@
+ #include <type_traits>
+ #include <utility>
+ 
++#include "include/v8-fast-api-calls.h"
+ #include "src/base/bits.h"
+ #include "src/base/bounds.h"
+ #include "src/base/container-utils.h"
+@@ -10968,6 +10969,51 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceCallForApiFunction(
+ 
+   ValueNode* tagged_receiver;
+   GET_VALUE_OR_ABORT(tagged_receiver, GetTaggedValue(receiver));
++#if defined(V8_TARGET_ARCH_X64) && V8_OS_LINUX && !defined(USE_SIMULATOR)
++  // This is not inferred from a scalar signature or SideEffectType. Unmarked
++  // APIs retain the callback path, including its GC/reentry/exception support.
++  // Accessor reductions have no SharedFunctionInfo and are excluded as well.
++  if (!is_turbolev() && maybe_shared.has_value() &&
++      v8_flags.turbo_fast_api_calls && mode != CallKnownApiFunction::kGeneric) {
++    auto functions = api_callback.c_functions_with_signatures(broker());
++    if (functions.size() == 1) {
++      const auto& function = functions[0];
++      const CFunctionInfo* signature = function.signature;
++      const bool returns_void =
++          signature->ReturnInfo().GetType() == CTypeInfo::Type::kVoid;
++      const bool returns_i32 =
++          signature->ReturnInfo().GetType() == CTypeInfo::Type::kInt32;
++      const unsigned int argc = returns_void ? 1 : 2;  // Includes receiver.
++      if (function.address != kNullAddress &&
++          signature->GetNativeCallContract() ==
++              CFunctionInfo::NativeCallContract::kBoundedNoVM &&
++          signature->HasReceiverArg() && !signature->HasOptions() &&
++          signature->GetInt64Representation() ==
++              CFunctionInfo::Int64Representation::kNumber &&
++          (returns_void || (returns_i32 && SmiValuesAre32Bits())) &&
++          signature->ReturnInfo().GetFlags() == CTypeInfo::Flags::kNone &&
++          signature->ArgumentCount() == argc && args.count() == argc - 1 &&
++          signature->ArgumentInfo(0).GetType() == CTypeInfo::Type::kV8Value &&
++          signature->ArgumentInfo(0).GetFlags() == CTypeInfo::Flags::kNone &&
++          (returns_void ||
++           (signature->ArgumentInfo(1).GetType() == CTypeInfo::Type::kInt32 &&
++            signature->ArgumentInfo(1).GetFlags() ==
++                CTypeInfo::Flags::kNone))) {
++        ValueNode* value = GetInt32Constant(0);
++        if (!returns_void) {
++          // Unlike truncating Fast API conversions, this checks integrality,
++          // range, Number type and negative zero before entering the leaf.
++          GET_VALUE_OR_ABORT(value, GetInt32(args[0], true));
++        }
++        ValueNode* tagged_context;
++        GET_VALUE_OR_ABORT(tagged_context, GetTaggedValue(GetContext()));
++        return AddNewNode<CallBoundedNative>(
++            {tagged_context, tagged_receiver, value}, function.address,
++            returns_void);
++      }
++    }
++  }
++#endif
+   return AddNewNode<CallKnownApiFunction>(
+       input_count,
+       [&](CallKnownApiFunction* call) {
+diff --git a/src/maglev/maglev-ir.h b/src/maglev/maglev-ir.h
+index c5a3a5b0..bb7293e5 100644
+--- a/src/maglev/maglev-ir.h
++++ b/src/maglev/maglev-ir.h
+@@ -270,7 +270,14 @@ class ExceptionHandlerInfo;
+   V(UnsafeSmiTagUint32)                 \
+   V(UnsafeSmiUntag)
+ 
++#if defined(V8_TARGET_ARCH_X64) && V8_OS_LINUX && !defined(USE_SIMULATOR)
++#define BOUNDED_NATIVE_VALUE_NODE_LIST(V) V(CallBoundedNative)
++#else
++#define BOUNDED_NATIVE_VALUE_NODE_LIST(V)
++#endif
++
+ #define VALUE_NODE_LIST(V)                                            \
++  BOUNDED_NATIVE_VALUE_NODE_LIST(V)                                   \
+   V(Identity)                                                         \
+   V(DeadValue)                                                        \
+   V(AllocationBlock)                                                  \
+@@ -10752,6 +10759,37 @@ class CallKnownBuiltin : public VarargsValueNodeT<4, CallKnownBuiltin> {
+   compiler::FeedbackSource feedback_source_;
+ };
+ 
++#if defined(V8_TARGET_ARCH_X64) && V8_OS_LINUX && !defined(USE_SIMULATOR)
++// A call to an explicitly audited bounded native leaf. It has ordinary memory
++// effects, but cannot GC, throw or lazily deopt while in C. Checks must precede
++// the call; the result is tagged without any possible failure after the call.
++class CallBoundedNative : public FixedInputValueNodeT<3, CallBoundedNative> {
++ public:
++  CallBoundedNative(uint64_t bitfield, Address address, bool returns_void)
++      : Base(bitfield), address_(address), returns_void_(returns_void) {}
++
++  static constexpr OpProperties kProperties =
++      OpProperties::Call() | OpProperties::NotIdempotent() |
++      OpProperties::CanRead() | OpProperties::CanWrite();
++  DECLARE_INPUTS(Context, Receiver, Value)
++  DECLARE_INPUT_TYPES(Tagged, Tagged, Int32)
++
++  Address address() const { return address_; }
++  bool returns_void() const { return returns_void_; }
++  NodeType type() const {
++    return returns_void_ ? NodeType::kUndefined : NodeType::kSmi;
++  }
++  int MaxCallStackArgs() const;
++  void SetValueLocationConstraints();
++  void GenerateCode(MaglevAssembler*, const ProcessingState&);
++  void PrintParams(std::ostream&) const;
++
++ private:
++  const Address address_;
++  const bool returns_void_;
++};
++#endif
++
+ class CallKnownApiFunction : public VarargsValueNodeT<1, CallKnownApiFunction> {
+  public:
+   enum Mode {
+diff --git a/src/maglev/x64/maglev-ir-x64.cc b/src/maglev/x64/maglev-ir-x64.cc
+index cca74ccc..44fc024b 100644
+--- a/src/maglev/x64/maglev-ir-x64.cc
++++ b/src/maglev/x64/maglev-ir-x64.cc
+@@ -14,6 +14,7 @@
+ #include "src/maglev/maglev-graph.h"
+ #include "src/maglev/maglev-ir-inl.h"
+ #include "src/maglev/maglev-ir.h"
++#include "src/objects/contexts.h"
+ #include "src/objects/dictionary.h"
+ #include "src/objects/feedback-cell.h"
+ #include "src/objects/instance-type.h"
+@@ -1000,6 +1001,75 @@ void Float64Max::GenerateCode(MaglevAssembler* masm,
+       [&]() {});
+ }
+ 
++#if V8_OS_LINUX && !defined(USE_SIMULATOR)
++int CallBoundedNative::MaxCallStackArgs() const {
++  int slots = MaglevAssembler::ArgumentStackSlotsForCFunctionCall(
++      returns_void() ? 1 : 2);
++#ifndef V8_ENABLE_DIRECT_HANDLE
++  // The receiver's Local<Value> slot survives Prepare/CallCFunction.
++  ++slots;
++#endif
++  return slots;
++}
++
++void CallBoundedNative::SetValueLocationConstraints() {
++  UseRegister(ContextInput());
++  UseFixed(ReceiverInput(), kCArgRegs[0]);
++  if (returns_void()) {
++    UseAny(ValueInput());
++  } else {
++    UseFixed(ValueInput(), kCArgRegs[1]);
++  }
++  DefineAsFixed(this, kReturnRegister0);
++}
++
++void CallBoundedNative::GenerateCode(MaglevAssembler* masm,
++                                     const ProcessingState& state) {
++  AllowExternalCallThatCantCauseGC scope(masm);
++  const int argc = returns_void() ? 1 : 2;
++  __ movq(__ ExternalReferenceAsOperand(IsolateFieldId::kContext),
++          ToRegister(ContextInput()));
++#ifndef V8_ENABLE_DIRECT_HANDLE
++  // Local<Value> is a pointer to a real tagged slot in indirect-handle builds.
++  // Keep that slot above the C alignment area, until CallCFunction restores SP.
++  __ Push(kCArgRegs[0]);
++  __ movq(kCArgRegs[0], rsp);
++#endif
++  __ PrepareCallCFunction(argc);
++  __ Move(rax,
++          ExternalReference::Create(address(), ExternalReference::FAST_C_CALL));
++  __ movq(__ ExternalReferenceAsOperand(IsolateFieldId::kFastApiCallTarget),
++          rax);
++  // The default publishes FP/PC and restores the saved SP immediately on
++  // return. There is deliberately no GC/lazy-deopt point at the C return PC.
++  __ CallCFunction(rax, argc);
++#ifndef V8_ENABLE_DIRECT_HANDLE
++  __ addq(rsp, Immediate(kSystemPointerSize));
++#endif
++  __ movq(__ ExternalReferenceAsOperand(IsolateFieldId::kFastApiCallTarget),
++          Immediate(0));
++#ifdef DEBUG
++  __ movq(__ ExternalReferenceAsOperand(IsolateFieldId::kContext),
++          Immediate(Context::kNoContext));
++#endif
++  if (returns_void()) {
++    __ LoadRoot(rax, RootIndex::kUndefinedValue);
++  } else {
++    if constexpr (SmiValuesAre32Bits()) {
++      // No allocation, overflow check or deopt may replay the completed call.
++      __ UncheckedSmiTagInt32(rax);
++    } else {
++      UNREACHABLE();  // The graph builder excludes i32 on 31-bit Smi builds.
++    }
++  }
++}
++
++void CallBoundedNative::PrintParams(std::ostream& os) const {
++  os << "(" << (returns_void() ? "void" : "i32") << ", "
++     << reinterpret_cast<void*>(address()) << ")";
++}
++#endif
++
+ int Float64Ieee754Unary::MaxCallStackArgs() const {
+   return MaglevAssembler::ArgumentStackSlotsForCFunctionCall(1);
+ }
+diff --git a/test/cctest/test-api.cc b/test/cctest/test-api.cc
+index 17711879..1cf1a72f 100644
+--- a/test/cctest/test-api.cc
++++ b/test/cctest/test-api.cc
+@@ -28,8 +28,10 @@
+ #include "test/cctest/test-api.h"
+ 
+ #include <array>
++#include <atomic>
+ #include <climits>
+ #include <csignal>
++#include <cstring>
+ #include <map>
+ #include <memory>
+ #include <optional>
+@@ -75,6 +77,7 @@
+ #include "src/heap/incremental-marking.h"
+ #include "src/init/v8.h"
+ #include "src/logging/metrics.h"
++#include "src/objects/deoptimization-data-inl.h"
+ #include "src/objects/feedback-vector-inl.h"
+ #include "src/objects/feedback-vector.h"
+ #include "src/objects/hash-table-inl.h"
+@@ -29924,6 +29927,421 @@ TEST(FastApiCallsWithoutReceiver) {
+ #endif
+ }
+ 
++#if defined(V8_ENABLE_MAGLEV) && defined(V8_TARGET_ARCH_X64) && V8_OS_LINUX && \
++    !defined(USE_SIMULATOR)
++namespace {
++
++// Native-only state: the marked callees below never enter V8, wait, allocate,
++// or process interrupts. Reading the Local's representation checks the real
++// receiver ABI without invoking any V8 API from inside the bounded leaf.
++std::atomic<int> bounded_noop_fast{0};
++int bounded_noop_slow = 0;
++int bounded_i32_fast = 0;
++int bounded_i32_slow = 0;
++int unmarked_i32_fast = 0;
++int unmarked_i32_slow = 0;
++uintptr_t bounded_receiver = 0;
++bool unmarked_gc = false;
++bool unmarked_deopt = false;
++
++void RecordBoundedReceiver(v8::Local<v8::Value> receiver) {
++  static_assert(sizeof(receiver) == sizeof(uintptr_t));
++  uintptr_t representation;
++  std::memcpy(&representation, &receiver, sizeof(representation));
++#ifdef V8_ENABLE_DIRECT_HANDLE
++  bounded_receiver = representation;
++#else
++  std::memcpy(&bounded_receiver, reinterpret_cast<const void*>(representation),
++              sizeof(bounded_receiver));
++#endif
++}
++
++void BoundedNoop(v8::Local<v8::Value> receiver) {
++  RecordBoundedReceiver(receiver);
++  bounded_noop_fast.fetch_add(1, std::memory_order_relaxed);
++}
++
++int32_t BoundedIdentity(v8::Local<v8::Value> receiver, int32_t value) {
++  RecordBoundedReceiver(receiver);
++  ++bounded_i32_fast;
++  return value;
++}
++
++void CheckBoundedCallbackData(const v8::FunctionCallbackInfo<v8::Value>& info) {
++  CHECK(i::ValidateCallbackInfo(info));
++  CHECK(info.Data()->IsObject());
++  CHECK_EQ(42,
++           info.Data()
++               .As<v8::Object>()
++               ->Get(info.GetIsolate()->GetCurrentContext(), v8_str("token"))
++               .ToLocalChecked()
++               ->Int32Value(info.GetIsolate()->GetCurrentContext())
++               .FromJust());
++}
++
++void BoundedNoopSlow(const v8::FunctionCallbackInfo<v8::Value>& info) {
++  CheckBoundedCallbackData(info);
++  ++bounded_noop_slow;
++  if (info.Length() != 0) {
++    info.GetIsolate()->ThrowException(
++        v8::Exception::TypeError(v8_str("arity")));
++  }
++}
++
++void BoundedIdentitySlow(const v8::FunctionCallbackInfo<v8::Value>& info) {
++  CheckBoundedCallbackData(info);
++  ++bounded_i32_slow;
++  if (info.Length() != 1 || !info[0]->IsInt32() ||
++      (info[0]->NumberValue(info.GetIsolate()->GetCurrentContext())
++               .FromJust() == 0 &&
++       std::signbit(info[0]
++                        ->NumberValue(info.GetIsolate()->GetCurrentContext())
++                        .FromJust()))) {
++    info.GetIsolate()->ThrowException(v8::Exception::TypeError(v8_str("i32")));
++    return;
++  }
++  info.GetReturnValue().Set(info[0]);
++}
++
++// Same signature without the contract: its callback is allowed to GC and
++// invalidate the caller. Maglev must keep it on the ordinary API path.
++int32_t UnmarkedIdentity(v8::Local<v8::Value> receiver, int32_t value) {
++  ++unmarked_i32_fast;
++  i::heap::InvokeMajorGC(CcTest::heap());
++  return value;
++}
++
++void UnmarkedIdentitySlow(const v8::FunctionCallbackInfo<v8::Value>& info) {
++  CheckBoundedCallbackData(info);
++  ++unmarked_i32_slow;
++  if (unmarked_gc) i::heap::InvokeMajorGC(CcTest::heap());
++  CheckBoundedCallbackData(info);
++  if (unmarked_deopt) CompileRun("%DeoptimizeFunction(afterLeaf)");
++  info.GetReturnValue().Set(info[0]);
++}
++
++class BoundedNativeMaglevTest {
++ public:
++  BoundedNativeMaglevTest()
++      : natives_(&i::v8_flags.allow_natives_syntax, true),
++        maglev_(&i::v8_flags.maglev, true),
++        turbofan_(&i::v8_flags.turbofan, false),
++        turbolev_(&i::v8_flags.turbolev, false),
++        concurrent_(&i::v8_flags.concurrent_recompilation, false),
++        fast_api_(&i::v8_flags.turbo_fast_api_calls, true),
++        inlining_(&i::v8_flags.maglev_inlining, true) {
++    CHECK(i::SmiValuesAre32Bits());
++    CcTest::InitializeVM();
++    bounded_noop_fast = bounded_noop_slow = 0;
++    bounded_i32_fast = bounded_i32_slow = 0;
++    unmarked_i32_fast = unmarked_i32_slow = 0;
++    unmarked_gc = unmarked_deopt = false;
++  }
++
++  void Install(v8::Local<v8::Context> context) {
++    v8::Isolate* isolate = context->GetIsolate();
++    v8::HandleScope scope(isolate);
++    static const v8::CTypeInfo arguments[] = {
++        v8::CTypeInfo(v8::CTypeInfo::Type::kV8Value),
++        v8::CTypeInfo(v8::CTypeInfo::Type::kInt32)};
++    static const v8::CFunctionInfo noop_info(
++        v8::CTypeInfo(v8::CTypeInfo::Type::kVoid), 1, arguments,
++        v8::CFunctionInfo::Int64Representation::kNumber,
++        v8::CFunctionInfo::HasReceiver::kYes,
++        v8::CFunctionInfo::NativeCallContract::kBoundedNoVM);
++    static const v8::CFunctionInfo identity_info(
++        v8::CTypeInfo(v8::CTypeInfo::Type::kInt32), 2, arguments,
++        v8::CFunctionInfo::Int64Representation::kNumber,
++        v8::CFunctionInfo::HasReceiver::kYes,
++        v8::CFunctionInfo::NativeCallContract::kBoundedNoVM);
++    static const v8::CFunction noop(reinterpret_cast<const void*>(BoundedNoop),
++                                    &noop_info);
++    static const v8::CFunction identity(
++        reinterpret_cast<const void*>(BoundedIdentity), &identity_info);
++    static const v8::CFunction unmarked = v8::CFunction::Make(UnmarkedIdentity);
++    CHECK_EQ(v8::CFunctionInfo::NativeCallContract::kDefault,
++             unmarked.GetTypeInfo()->GetNativeCallContract());
++    auto install = [&](const char* name, v8::FunctionCallback callback,
++                       const v8::CFunction* fast) {
++      v8::Local<v8::Object> data = v8::Object::New(isolate);
++      CHECK(data->Set(context, v8_str("token"), v8_int(42)).FromJust());
++      auto function = v8::FunctionTemplate::New(
++                          isolate, callback, data, Local<v8::Signature>(), 0,
++                          v8::ConstructorBehavior::kThrow,
++                          v8::SideEffectType::kHasSideEffect, fast)
++                          ->GetFunction(context)
++                          .ToLocalChecked();
++      CHECK(context->Global()->Set(context, v8_str(name), function).FromJust());
++    };
++    install("boundedNoop", BoundedNoopSlow, &noop);
++    install("boundedIdentity", BoundedIdentitySlow, &identity);
++    install("unmarkedIdentity", UnmarkedIdentitySlow, &unmarked);
++    install("checkedIdentity", BoundedIdentitySlow, nullptr);
++
++    // Match the real getter's CompileFunction closure and free raw(value) call.
++    v8::ScriptOrigin origin(v8_str("lo-bun:binding/bounded.identity"));
++    v8::ScriptCompiler::Source source(v8_str(R"JS(
++      'use strict';
++      return ({ identity() {
++        if (arguments.length !== 1) { throw slow(); }
++        const value = arguments[0];
++        if (typeof value !== 'number' || value !== (value | 0) || same(value, -0)) {
++          throw slow(undefined);
++        }
++        return raw(value);
++      } }).identity;
++    )JS"),
++                                      origin);
++    v8::Local<v8::String> names[] = {v8_str("raw"), v8_str("slow"),
++                                     v8_str("same")};
++    auto factory =
++        v8::ScriptCompiler::CompileFunction(context, &source, 3, names)
++            .ToLocalChecked();
++    v8::Local<v8::Value> values[] = {CompileRun("boundedIdentity"),
++                                     CompileRun("checkedIdentity"),
++                                     CompileRun("Object.is")};
++    auto wrapper = factory->Call(context, v8::Undefined(isolate), 3, values)
++                       .ToLocalChecked();
++    CHECK(context->Global()
++              ->Set(context, v8_str("strictIdentity"), wrapper)
++              .FromJust());
++  }
++
++ private:
++  i::FlagScope<bool> natives_, maglev_, turbofan_, turbolev_, concurrent_,
++      fast_api_, inlining_;
++};
++
++i::DirectHandle<i::JSFunction> BoundedTestFunction(const char* name) {
++  return i::Cast<i::JSFunction>(v8::Utils::OpenDirectHandle(*CompileRun(name)));
++}
++
++void CheckBoundedMaglev(const char* name) {
++  CHECK(BoundedTestFunction(name)->ActiveTierIsMaglev(CcTest::i_isolate()));
++}
++
++}  // namespace
++#endif
++
++TEST(FastApiBoundedNativeMaglev) {
++#if defined(V8_ENABLE_MAGLEV) && defined(V8_TARGET_ARCH_X64) && V8_OS_LINUX && \
++    !defined(USE_SIMULATOR)
++  if (i::v8_flags.jitless || i::v8_flags.disable_optimizing_compilers) return;
++  BoundedNativeMaglevTest flags;
++  v8::HandleScope scope(CcTest::isolate());
++  LocalContext env;
++  flags.Install(env.local());
++  CompileRun(R"JS(
++    function callNoop() { return boundedNoop(); }
++    function callIdentity(value) { return boundedIdentity(value); }
++    function callUnmarked(value) { return unmarkedIdentity(value); }
++    for (const fn of [callNoop, callIdentity, callUnmarked]) {
++      %PrepareFunctionForOptimization(fn);
++      fn(31); fn(31);
++      %OptimizeMaglevOnNextCall(fn);
++      fn(31);
++    }
++  )JS");
++  CheckBoundedMaglev("callNoop");
++  CheckBoundedMaglev("callIdentity");
++  CheckBoundedMaglev("callUnmarked");
++  bounded_noop_fast = bounded_noop_slow = 0;
++  bounded_i32_fast = bounded_i32_slow = 0;
++  CHECK(CompileRun("callNoop()")->IsUndefined());
++  CHECK_EQ(1, bounded_noop_fast.load());
++  CHECK_EQ(0, bounded_noop_slow);
++  CHECK_EQ(v8::Utils::OpenDirectHandle(*env->Global())->ptr(),
++           bounded_receiver);
++  ExpectInt32("callIdentity(-2147483648)", std::numeric_limits<int32_t>::min());
++  ExpectInt32("callIdentity(2147483647)", std::numeric_limits<int32_t>::max());
++  CHECK_EQ(2, bounded_i32_fast);
++  CHECK_EQ(0, bounded_i32_slow);
++  i::heap::InvokeMajorGC(CcTest::heap());
++  CHECK(CompileRun("callNoop()")->IsUndefined());
++  ExpectInt32("callIdentity(31)", 31);
++  CHECK_EQ(2, bounded_noop_fast.load());
++  CHECK_EQ(0, bounded_noop_slow);
++  CHECK_EQ(3, bounded_i32_fast);
++  CHECK_EQ(0, bounded_i32_slow);
++  CHECK_EQ(v8::Utils::OpenDirectHandle(*env->Global())->ptr(),
++           bounded_receiver);
++  unmarked_gc = true;
++  ExpectInt32("callUnmarked(31)", 31);
++  CHECK_GT(unmarked_i32_slow, 0);
++  CHECK_EQ(0, unmarked_i32_fast);
++  // Each invalid value reaches a fresh, actually optimized typed guard. Reusing
++  // one caller would test only the ordinary callback after its first deopt.
++  const char* invalid_values[] = {"1.5",        "NaN",         "Infinity",
++                                  "2147483648", "-2147483649", "-0",
++                                  "'31'",       "{}",          "undefined"};
++  for (size_t index = 0; index < arraysize(invalid_values); ++index) {
++    const std::string name = "invalidGuard" + std::to_string(index);
++    const std::string setup =
++        "function " + name + "(value) { return boundedIdentity(value); }\n" +
++        "%PrepareFunctionForOptimization(" + name + ");" + name + "(31);" +
++        name + "(31); %OptimizeMaglevOnNextCall(" + name + ");" + name +
++        "(31);";
++    CompileRun(setup.c_str());
++    CheckBoundedMaglev(name.c_str());
++    bounded_i32_fast = bounded_i32_slow = 0;
++    const std::string rejected =
++        "(() => { try { " + name + "(" + invalid_values[index] +
++        "); } catch (e) { return e instanceof TypeError; } return false; })()";
++    ExpectTrue(rejected.c_str());
++    CHECK_EQ(0, bounded_i32_fast);
++    CHECK_EQ(1, bounded_i32_slow);
++  }
++  bounded_i32_fast = bounded_noop_fast = 0;
++  ExpectTrue(R"JS(
++    function missingArg() {
++      try { boundedIdentity(); } catch (e) { return e instanceof TypeError; }
++      return false;
++    }
++    function extraArg() {
++      try { boundedIdentity(1, 2); } catch (e) { return e instanceof TypeError; }
++      return false;
++    }
++    function extraNoopArg() {
++      try { boundedNoop(1); } catch (e) { return e instanceof TypeError; }
++      return false;
++    }
++    [missingArg, extraArg, extraNoopArg].every(fn => {
++      %PrepareFunctionForOptimization(fn);
++      if (!fn() || !fn()) return false;
++      %OptimizeMaglevOnNextCall(fn);
++      return fn() && %ActiveTierIsMaglev(fn);
++    });
++  )JS");
++  CHECK_EQ(0, bounded_i32_fast);
++  CHECK_EQ(0, bounded_noop_fast.load());
++  ExpectTrue(R"JS(
++    [() => boundedIdentity(), () => boundedIdentity(1, 2),
++     () => boundedNoop(1), () => strictIdentity(), () => strictIdentity(-0)]
++      .every(call => { try { call(); } catch (e) {
++        return e instanceof TypeError;
++      } return false; })
++  )JS");
++  ExpectTrue(R"JS(
++    (() => { try { strictIdentity(-0); } catch (e) {
++      return e.stack.includes('lo-bun:binding/bounded.identity');
++    } return false; })()
++  )JS");
++  ExpectTrue(R"JS(
++    strictIdentity.name === 'identity' && strictIdentity.length === 0 &&
++    !Object.hasOwn(strictIdentity, 'prototype') &&
++    (() => { try { new strictIdentity(1); } catch (e) {
++      return e instanceof TypeError;
++    } return false; })()
++  )JS");
++#endif
++}
++
++TEST(FastApiBoundedNativeMaglevDeopt) {
++#if defined(V8_ENABLE_MAGLEV) && defined(V8_TARGET_ARCH_X64) && V8_OS_LINUX && \
++    !defined(USE_SIMULATOR)
++  if (i::v8_flags.jitless || i::v8_flags.disable_optimizing_compilers) return;
++  BoundedNativeMaglevTest flags;
++  i::FlagScope<int> inline_size(&i::v8_flags.max_maglev_inlined_bytecode_size,
++                                300);
++  v8::HandleScope scope(CcTest::isolate());
++  LocalContext env;
++  flags.Install(env.local());
++  CompileRun(R"JS(
++    function overflow(value) { return boundedIdentity(value) + 1; }
++    function overflowStrict(value) { return strictIdentity(value) + 1; }
++    function afterLeaf(value) {
++      const retained = { value: 11 };
++      const result = strictIdentity(value);
++      unmarkedIdentity(value);
++      return result + retained.value;
++    }
++    for (const fn of [overflow, overflowStrict, afterLeaf]) {
++      %PrepareFunctionForOptimization(fn);
++      fn(1); fn(2);
++      %OptimizeMaglevOnNextCall(fn);
++      fn(3);
++    }
++  )JS");
++  CheckBoundedMaglev("overflow");
++  CheckBoundedMaglev("overflowStrict");
++  CheckBoundedMaglev("afterLeaf");
++  auto wrapper = BoundedTestFunction("strictIdentity");
++  auto data = BoundedTestFunction("overflowStrict")
++                  ->code(CcTest::i_isolate())
++                  ->deoptimization_data();
++  bool found_wrapper = false;
++  for (int i = 0; i < data->InlinedFunctionCount().value(); ++i) {
++    found_wrapper |= data->GetInlinedFunction(i) == wrapper->shared();
++  }
++  CHECK(found_wrapper);
++  bounded_i32_fast = bounded_i32_slow = 0;
++  CHECK_EQ(
++      2147483648.0,
++      CompileRun("overflow(2147483647)")->NumberValue(env.local()).FromJust());
++  CHECK_EQ(1, bounded_i32_fast);
++  CHECK_EQ(0, bounded_i32_slow);
++  CHECK(!BoundedTestFunction("overflow")
++             ->ActiveTierIsMaglev(CcTest::i_isolate()));
++  bounded_i32_fast = bounded_i32_slow = 0;
++  CHECK_EQ(2147483648.0, CompileRun("overflowStrict(2147483647)")
++                             ->NumberValue(env.local())
++                             .FromJust());
++  CHECK_EQ(1, bounded_i32_fast);
++  CHECK_EQ(0, bounded_i32_slow);
++  CHECK(!BoundedTestFunction("overflowStrict")
++             ->ActiveTierIsMaglev(CcTest::i_isolate()));
++  bounded_i32_fast = bounded_i32_slow = 0;
++  unmarked_gc = unmarked_deopt = true;
++  ExpectInt32("afterLeaf(31)", 42);
++  CHECK_EQ(1, bounded_i32_fast);
++  CHECK_EQ(0, bounded_i32_slow);
++  CHECK_EQ(0, unmarked_i32_fast);
++  CHECK(!BoundedTestFunction("afterLeaf")
++             ->ActiveTierIsMaglev(CcTest::i_isolate()));
++#endif
++}
++
++TEST(FastApiBoundedNativeMaglevTermination) {
++#if defined(V8_ENABLE_MAGLEV) && defined(V8_TARGET_ARCH_X64) && V8_OS_LINUX && \
++    !defined(USE_SIMULATOR)
++  if (i::v8_flags.jitless || i::v8_flags.disable_optimizing_compilers) return;
++  BoundedNativeMaglevTest flags;
++  v8::Isolate* isolate = CcTest::isolate();
++  v8::HandleScope scope(isolate);
++  LocalContext env;
++  flags.Install(env.local());
++  CompileRun(R"JS(
++    var boundedCaught = false, boundedAfter = false;
++    function boundedLoop(count) {
++      try {
++        for (let i = 0; i < count; ++i) boundedNoop();
++      } catch (e) { boundedCaught = true; }
++      boundedAfter = true;
++    }
++    %PrepareFunctionForOptimization(boundedLoop);
++    boundedLoop(10); boundedLoop(10);
++    %OptimizeMaglevOnNextCall(boundedLoop);
++    boundedLoop(10);
++    boundedCaught = boundedAfter = false;
++  )JS");
++  CheckBoundedMaglev("boundedLoop");
++  bounded_noop_fast = 0;
++  TerminateExecutionThread terminator(isolate);
++  {
++    v8::TryCatch try_catch(isolate);
++    CHECK(terminator.Start());
++    CHECK(CompileRun("boundedLoop(2147483647)").IsEmpty());
++    terminator.Join();
++    CHECK(try_catch.HasTerminated());
++    CHECK_GT(bounded_noop_fast.load(), 0);
++    isolate->CancelTerminateExecution();
++  }
++  ExpectFalse("boundedCaught || boundedAfter");
++  CHECK(CompileRun("boundedNoop()")->IsUndefined());
++  ExpectInt32("strictIdentity(31)", 31);
++#endif
++}
++
+ TEST(FastApiCalls) {
+ #if !defined(V8_LITE_MODE) && defined(V8_ENABLE_TURBOFAN)
+   if (i::v8_flags.jitless) return;

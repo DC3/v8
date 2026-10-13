@@ -1,5 +1,11 @@
 # 变更记录
 
+## [2026-10-13] 实施受限 bounded native leaf 的 Maglev 候选
+
+- 新增逐 callee 不可变、默认关闭的 NativeCallContract；仅显式承诺有界、不阻塞、不触 VM/GC/JS 重入的静态 native void()/i32(i32) 可进入新路径，不修改同签名共享 builder 实例。
+- Linux x64 普通 Maglev 复用既有 math C-call，保真实 receiver、调用前严格转换、保守内存 effects、Smi32 与调用后恢复；TF、Turbolev、未标记函数及其他调用形状保持原路径。生产源码独立审查通过，尚未完整构建或证明收益。
+- 原 27 项 native 门禁后追加三项永久回归，检查实际 Maglev 命中、同签名隔离、GC、溢出/lazy deopt exactly-once 与并发终止恢复；完整 seed 成套携带新 headers/lib，消费者必须重编 wrappers/napi。
+
 ## [2026-10-13] 允许受限调整 full seed 的 Ninja 并发
 
 - 构建脚本支持 LOBUN_V8_BUILD_JOBS，默认 2，仅接受 1 至 16 的整数；在创建目录或获取源码前拒绝非法输入，本地可显式使用 8。
