@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+readonly task_jobs="${LOBUN_V8_BUILD_JOBS-2}"
+if [[ ! "$task_jobs" =~ ^([1-9]|1[0-6])$ ]]; then
+  printf '%s\n' 'LOBUN_V8_BUILD_JOBS must be an integer from 1 to 16' >&2
+  exit 1
+fi
+
 # One manual producer, without shared V8 cache or dependency installation.
 readonly task_version=15.3.76.24
 readonly task_revision=107d9154d9d944f722c9f6af126849217660709c
@@ -73,7 +79,7 @@ test -x "$task_rust"
 test -x "$task_gn"
 {
   printf 'V8_VERSION=%s\nV8_REVISION=%s\nDEPOT_TOOLS_REVISION=%s\n' "$task_version" "$task_revision" "$task_depot_revision"
-  printf 'FORK_REVISION=%s\nNINJA_JOBS=2\nBUILD_TIMEOUT_MINUTES=270\n' "$(git -C "$task_repo" rev-parse HEAD)"
+  printf 'FORK_REVISION=%s\nNINJA_JOBS=%s\nBUILD_TIMEOUT_MINUTES=270\n' "$(git -C "$task_repo" rev-parse HEAD)" "$task_jobs"
   uname -a
   "$task_clang/clang++" --version
   "$task_clang/ld.lld" --version
@@ -89,11 +95,11 @@ test -x "$task_gn"
   # Compile the namespace port first; the full build reuses these same objects.
   timeout --signal=TERM --kill-after=30s 270m \
     bash -e -u -o pipefail -c '
-      "$1" -j2 -C out.gn/linux.x64.release \
+      "$1" -j"$2" -C out.gn/linux.x64.release \
         obj/v8_base_without_compiler/builtins-object.o \
         obj/v8_base_without_compiler/module.o
-      "$1" -j2 -C out.gn/linux.x64.release v8_monolith cctest v8_unittests
-    ' -- "$task_ninja"
+      "$1" -j"$2" -C out.gn/linux.x64.release v8_monolith cctest v8_unittests
+    ' -- "$task_ninja" "$task_jobs"
 )
 df -h "$task_work"
 
