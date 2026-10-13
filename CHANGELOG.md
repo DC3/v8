@@ -1,5 +1,10 @@
 # 变更记录
 
+## [2026-10-13] 关闭 V8 未使用的 GLib 构建依赖
+
+- 第二轮 CI38351688567 通过 Ninja 检查，在 GN 全局配置求值时因 runner 缺少 GLib 开发包失败，尚未编译 V8；保留原失败日志。
+- 显式设置 use_glib=false：固定源码的 V8 目标和 lo 事件循环均未使用 GLib，消除 Chromium Linux 配置默认触发的 pkg-config 检查；保留 use_sysroot=false、标准库、引擎能力与原生门禁配置。
+
 ## [2026-10-13] 修正手动构建的 Ninja 选择
 
 - 首轮 CI38351053324 在 Ninja 版本检查失败：depot_tools 的未 bootstrap 包装脚本遮住 runner 工具，尚未进入 GN/V8 编译；保留原失败记录。
