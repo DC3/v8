@@ -1,0 +1,467 @@
+diff --git a/src/compiler/bytecode-graph-builder.cc b/src/compiler/bytecode-graph-builder.cc
+index a8486d7a..58707ee9 100644
+--- a/src/compiler/bytecode-graph-builder.cc
++++ b/src/compiler/bytecode-graph-builder.cc
+@@ -20,6 +20,7 @@
+ #include "src/compiler/feedback-source.h"
+ #include "src/compiler/frame-states.h"
+ #include "src/compiler/js-heap-broker.h"
++#include "src/compiler/js-context-specialization.h"
+ #include "src/compiler/js-type-hint-lowering.h"
+ #include "src/compiler/linkage.h"
+ #include "src/compiler/node-matchers.h"
+@@ -51,7 +52,8 @@ class BytecodeGraphBuilder {
+       JSGraph* jsgraph, CallFrequency const& invocation_frequency,
+       SourcePositionTable* source_positions, NodeOriginTable* node_origins,
+       int inlining_id, CodeKind code_kind, BytecodeGraphBuilderFlags flags,
+-      TickCounter* tick_counter, ObserveNodeInfo const& observe_node_info);
++      TickCounter* tick_counter, ObserveNodeInfo const& observe_node_info,
++      OsrContextSpecialization* osr_context);
+ 
+   BytecodeGraphBuilder(const BytecodeGraphBuilder&) = delete;
+   BytecodeGraphBuilder& operator=(const BytecodeGraphBuilder&) = delete;
+@@ -538,6 +540,7 @@ class BytecodeGraphBuilder {
+   TickCounter* const tick_counter_;
+ 
+   ObserveNodeInfo const observe_node_info_;
++  OsrContextSpecialization* const osr_context_;
+ 
+   static constexpr int kBinaryOperationHintIndex = 1;
+   static constexpr int kCompareOperationHintIndex = 1;
+@@ -1060,7 +1063,8 @@ BytecodeGraphBuilder::BytecodeGraphBuilder(
+     CallFrequency const& invocation_frequency,
+     SourcePositionTable* source_positions, NodeOriginTable* node_origins,
+     int inlining_id, CodeKind code_kind, BytecodeGraphBuilderFlags flags,
+-    TickCounter* tick_counter, ObserveNodeInfo const& observe_node_info)
++    TickCounter* tick_counter, ObserveNodeInfo const& observe_node_info,
++    OsrContextSpecialization* osr_context)
+     : broker_(broker),
+       local_isolate_(broker_->local_isolate()
+                          ? broker_->local_isolate()
+@@ -1111,7 +1115,8 @@ BytecodeGraphBuilder::BytecodeGraphBuilder(
+       source_positions_(source_positions),
+       start_position_(shared_info.StartPosition(), inlining_id),
+       tick_counter_(tick_counter),
+-      observe_node_info_(observe_node_info) {}
++      observe_node_info_(observe_node_info),
++      osr_context_(osr_context) {}
+ 
+ Node* BytecodeGraphBuilder::GetFunctionClosure() {
+   if (!function_closure_.is_set()) {
+@@ -1405,6 +1410,22 @@ void BytecodeGraphBuilder::AdvanceToOsrEntryAndPeelLoops() {
+   //   }
+   BuildOSREntryStackCheck();
+ 
++  if (osr_context_ != nullptr) {
++    const BytecodeOffset offset = bytecode_analysis().osr_bailout_id();
++    Node* checkpoint = NewNode(common()->Checkpoint());
++    NodeProperties::ReplaceFrameStateInput(
++        checkpoint, environment()->Checkpoint(
++                        offset, OutputFrameStateCombine::Ignore(),
++                        bytecode_analysis().GetOutLivenessFor(offset.ToInt())));
++    mark_as_needing_eager_checkpoint(false);
++    osr_context_->actual_context = environment()->Context();
++    Node* expected = jsgraph()->ConstantNoHole(
++        MakeRef(broker(), osr_context_->known_context), broker());
++    Node* equal = NewNode(simplified()->ReferenceEqual(),
++                          osr_context_->actual_context, expected);
++    NewNode(simplified()->CheckIf(DeoptimizeReason::kWrongValue), equal);
++  }
++
+   OsrIteratorState iterator_states(this);
+   iterator_states.ProcessOsrPrelude();
+   int osr_entry = bytecode_analysis().osr_entry_point();
+@@ -4872,12 +4893,13 @@ void BuildGraphFromBytecode(
+     CallFrequency const& invocation_frequency,
+     SourcePositionTable* source_positions, NodeOriginTable* node_origins,
+     int inlining_id, CodeKind code_kind, BytecodeGraphBuilderFlags flags,
+-    TickCounter* tick_counter, ObserveNodeInfo const& observe_node_info) {
++    TickCounter* tick_counter, ObserveNodeInfo const& observe_node_info,
++    OsrContextSpecialization* osr_context) {
+   BytecodeGraphBuilder builder(
+       broker, local_zone, broker->target_native_context(), shared_info,
+       bytecode, feedback_cell, osr_offset, jsgraph, invocation_frequency,
+       source_positions, node_origins, inlining_id, code_kind, flags,
+-      tick_counter, observe_node_info);
++      tick_counter, observe_node_info, osr_context);
+   builder.CreateGraph();
+ }
+ 
+diff --git a/src/compiler/bytecode-graph-builder.h b/src/compiler/bytecode-graph-builder.h
+index 644edd93..d66c98c7 100644
+--- a/src/compiler/bytecode-graph-builder.h
++++ b/src/compiler/bytecode-graph-builder.h
+@@ -27,6 +27,7 @@ class JSGraph;
+ class NodeObserver;
+ class SourcePositionTable;
+ class NodeOriginTable;
++struct OsrContextSpecialization;
+ 
+ enum class BytecodeGraphBuilderFlag : uint8_t {
+   kSkipFirstStackAndTierupCheck = 1 << 0,
+@@ -47,7 +48,8 @@ void BuildGraphFromBytecode(
+     CallFrequency const& invocation_frequency,
+     SourcePositionTable* source_positions, NodeOriginTable* node_origins,
+     int inlining_id, CodeKind code_kind, BytecodeGraphBuilderFlags flags,
+-    TickCounter* tick_counter, ObserveNodeInfo const& observe_node_info = {});
++    TickCounter* tick_counter, ObserveNodeInfo const& observe_node_info = {},
++    OsrContextSpecialization* osr_context = nullptr);
+ 
+ }  // namespace compiler
+ }  // namespace internal
+diff --git a/src/compiler/js-context-specialization.cc b/src/compiler/js-context-specialization.cc
+index 79791cf2..2924a133 100644
+--- a/src/compiler/js-context-specialization.cc
++++ b/src/compiler/js-context-specialization.cc
+@@ -149,7 +149,11 @@ bool IsContextParameter(Node* node) {
+ // distance remains from the specialization context.
+ OptionalContextRef GetSpecializationContext(JSHeapBroker* broker, Node* node,
+                                             size_t* distance,
+-                                            Maybe<OuterContext> maybe_outer) {
++                                            Maybe<OuterContext> maybe_outer,
++                                            const OsrContextSpecialization* osr) {
++  if (osr != nullptr && node == osr->actual_context) {
++    return MakeRef(broker, osr->known_context);
++  }
+   switch (node->opcode()) {
+     case IrOpcode::kHeapConstant: {
+       // TODO(jgruber,chromium:1209798): Using kAssumeMemoryFence works around
+@@ -192,7 +196,7 @@ Reduction JSContextSpecialization::ReduceJSLoadContextNoCell(Node* node) {
+   Node* context = NodeProperties::GetOuterContext(node, &depth);
+ 
+   OptionalContextRef maybe_concrete =
+-      GetSpecializationContext(broker(), context, &depth, outer());
++      GetSpecializationContext(broker(), context, &depth, outer(), osr_context_);
+   if (!maybe_concrete.has_value()) {
+     // We do not have a concrete context object, so we can only partially reduce
+     // the load by folding-in the outer context node.
+@@ -258,7 +262,7 @@ Reduction JSContextSpecialization::ReduceJSLoadContext(Node* node) {
+   Node* context = NodeProperties::GetOuterContext(node, &depth);
+ 
+   OptionalContextRef maybe_concrete =
+-      GetSpecializationContext(broker(), context, &depth, outer());
++      GetSpecializationContext(broker(), context, &depth, outer(), osr_context_);
+   if (!maybe_concrete.has_value()) {
+     // We do not have a concrete context object, so we can only partially reduce
+     // the load by folding-in the outer context node.
+@@ -356,7 +360,7 @@ Reduction JSContextSpecialization::ReduceJSStoreContextNoCell(Node* node) {
+   Node* context = NodeProperties::GetOuterContext(node, &depth);
+ 
+   OptionalContextRef maybe_concrete =
+-      GetSpecializationContext(broker(), context, &depth, outer());
++      GetSpecializationContext(broker(), context, &depth, outer(), osr_context_);
+   if (!maybe_concrete.has_value()) {
+     // We do not have a concrete context object, so we can only partially reduce
+     // the load by folding-in the outer context node.
+@@ -391,7 +395,7 @@ Reduction JSContextSpecialization::ReduceJSStoreContext(Node* node) {
+   Control control{NodeProperties::GetControlInput(node)};
+ 
+   OptionalContextRef maybe_concrete =
+-      GetSpecializationContext(broker(), context, &depth, outer());
++      GetSpecializationContext(broker(), context, &depth, outer(), osr_context_);
+   if (!maybe_concrete.has_value()) {
+     // We do not have a concrete context object, so we can only partially reduce
+     // the load by folding-in the outer context node.
+diff --git a/src/compiler/js-context-specialization.h b/src/compiler/js-context-specialization.h
+index 8e44ca79..8567e0b1 100644
+--- a/src/compiler/js-context-specialization.h
++++ b/src/compiler/js-context-specialization.h
+@@ -16,6 +16,11 @@ namespace compiler {
+ class JSGraph;
+ class JSOperatorBuilder;
+ 
++struct OsrContextSpecialization {
++  Node* actual_context = nullptr;
++  IndirectHandle<Context> known_context;
++};
++
+ // Pair of a context and its distance from some point of reference.
+ struct OuterContext {
+   OuterContext() = default;
+@@ -38,12 +43,14 @@ class V8_EXPORT_PRIVATE JSContextSpecialization final : public AdvancedReducer {
+  public:
+   JSContextSpecialization(Editor* editor, JSGraph* jsgraph,
+                           JSHeapBroker* broker, Maybe<OuterContext> outer,
+-                          MaybeHandle<JSFunction> closure)
++                          MaybeHandle<JSFunction> closure,
++                          const OsrContextSpecialization* osr_context = nullptr)
+       : AdvancedReducer(editor),
+         jsgraph_(jsgraph),
+         outer_(outer),
+         closure_(closure),
+-        broker_(broker) {}
++        broker_(broker),
++        osr_context_(osr_context) {}
+   JSContextSpecialization(const JSContextSpecialization&) = delete;
+   JSContextSpecialization& operator=(const JSContextSpecialization&) = delete;
+ 
+@@ -80,6 +87,7 @@ class V8_EXPORT_PRIVATE JSContextSpecialization final : public AdvancedReducer {
+   Maybe<OuterContext> outer_;
+   MaybeHandle<JSFunction> closure_;
+   JSHeapBroker* const broker_;
++  const OsrContextSpecialization* const osr_context_;
+ };
+ 
+ }  // namespace compiler
+diff --git a/src/compiler/pipeline-data-inl.h b/src/compiler/pipeline-data-inl.h
+index 88b4c3bc..d9c0ce7c 100644
+--- a/src/compiler/pipeline-data-inl.h
++++ b/src/compiler/pipeline-data-inl.h
+@@ -472,11 +472,23 @@ class TFPipelineData {
+             &info()->tick_counter(), debug_name());
+   }
+ 
++  OsrContextSpecialization* osr_context_specialization() {
++    return osr_context_specialization_.known_context.is_null()
++               ? nullptr
++               : &osr_context_specialization_;
++  }
++
+   void InitializeOsrHelper() {
+     DCHECK_NULL(osr_helper_);
+     osr_helper_ = std::make_shared<OsrHelper>(info());
+   }
+ 
++  void ChooseOsrSpecializationContext() {
++    DCHECK(info()->is_osr());
++    osr_context_specialization_.known_context =
++        info()->CanonicalHandle(info()->closure()->context(), isolate());
++  }
++
+   void set_start_source_position(int position) {
+     DCHECK_EQ(start_source_position_, kNoSourcePosition);
+     start_source_position_ = position;
+@@ -615,6 +627,7 @@ class TFPipelineData {
+   JumpOptimizationInfo* jump_optimization_info_ = nullptr;
+   AssemblerOptions assembler_options_;
+   Maybe<OuterContext> specialization_context_ = Nothing<OuterContext>();
++  OsrContextSpecialization osr_context_specialization_;
+ 
+   // The maximal combined height of all inlined frames in their unoptimized
+   // state, and the maximal number of arguments pushed during function calls.
+diff --git a/src/compiler/pipeline.cc b/src/compiler/pipeline.cc
+index 163c4d25..8605bf97 100644
+--- a/src/compiler/pipeline.cc
++++ b/src/compiler/pipeline.cc
+@@ -103,6 +103,8 @@
+ #include "src/logging/counters.h"
+ #include "src/logging/runtime-call-stats-scope.h"
+ #include "src/logging/runtime-call-stats.h"
++#include "src/interpreter/bytecode-array-iterator.h"
++#include "src/objects/function-kind.h"
+ #include "src/objects/code-kind.h"
+ #include "src/objects/shared-function-info.h"
+ #include "src/objects/string-inl.h"
+@@ -747,7 +749,26 @@ PipelineCompilationJob::Status PipelineCompilationJob::PrepareJobImpl(
+   linkage_ = compilation_info()->zone()->New<Linkage>(
+       Linkage::ComputeIncoming(compilation_info()->zone(), compilation_info()));
+ 
+-  if (compilation_info()->is_osr()) data_.InitializeOsrHelper();
++  if (compilation_info()->is_osr()) {
++    data_.InitializeOsrHelper();
++    if (!compilation_info()->shared_info()
++             ->function_context_independent_compiled() &&
++        compilation_info()->closure()->raw_feedback_cell()->map() ==
++            ReadOnlyRoots(isolate).one_closure_cell_map() &&
++        !IsResumableFunction(compilation_info()->shared_info()->kind())) {
++      bool switches_context = false;
++      for (interpreter::BytecodeArrayIterator iterator(
++               compilation_info()->bytecode_array());
++           !iterator.done(); iterator.Advance()) {
++        if (iterator.current_bytecode() == interpreter::Bytecode::kPushContext ||
++            iterator.current_bytecode() == interpreter::Bytecode::kPopContext) {
++          switches_context = true;
++          break;
++        }
++      }
++      if (!switches_context) data_.ChooseOsrSpecializationContext();
++    }
++  }
+ 
+   // InitializeHeapBroker() and CreateGraph() may already use
+   // IsPendingAllocation.
+@@ -882,7 +903,8 @@ struct GraphBuilderPhase {
+                            data->info()->code_kind(), flags,
+                            &data->info()->tick_counter(),
+                            ObserveNodeInfo{data->observe_node_manager(),
+-                                           data->info()->node_observer()});
++                                           data->info()->node_observer()},
++                           data->osr_context_specialization());
+ 
+     // We need to be certain that the parameter count reported by our output
+     // Code object matches what the code we compile expects. Otherwise, this
+@@ -922,7 +944,8 @@ struct InliningPhase {
+         data->specialization_context(),
+         data->info()->function_context_specializing()
+             ? data->info()->closure()
+-            : MaybeHandle<JSFunction>());
++            : MaybeHandle<JSFunction>(),
++        data->osr_context_specialization());
+     JSNativeContextSpecialization::Flags flags =
+         JSNativeContextSpecialization::kNoFlags;
+     if (data->info()->bailout_on_uninitialized()) {
+diff --git a/test/cctest/compiler/test-js-context-specialization.cc b/test/cctest/compiler/test-js-context-specialization.cc
+index 3478222b..7b01c3c9 100644
+--- a/test/cctest/compiler/test-js-context-specialization.cc
++++ b/test/cctest/compiler/test-js-context-specialization.cc
+@@ -2,6 +2,7 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include "src/api/api-inl.h"
+ #include "src/codegen/tick-counter.h"
+ #include "src/compiler/compilation-dependencies.h"
+ #include "src/compiler/compiler-source-position-table.h"
+@@ -15,10 +16,12 @@
+ #include "src/heap/factory.h"
+ #include "src/objects/contexts.h"
+ #include "src/objects/objects-inl.h"
++#include "src/objects/js-function-inl.h"
+ #include "src/objects/property.h"
+ #include "test/cctest/cctest.h"
+ #include "test/cctest/compiler/function-tester.h"
+ #include "test/cctest/compiler/js-heap-broker-base.h"
++#include "test/common/flag-utils.h"
+ 
+ namespace v8 {
+ namespace internal {
+@@ -27,7 +30,9 @@ namespace compiler {
+ class ContextSpecializationTester : public HandleAndZoneScope,
+                                     public JSHeapBrokerTestBase {
+  public:
+-  explicit ContextSpecializationTester(Maybe<OuterContext> context)
++  explicit ContextSpecializationTester(
++      Maybe<OuterContext> context,
++      const OsrContextSpecialization* osr_context = nullptr)
+       : JSHeapBrokerTestBase(main_isolate(), main_zone()),
+         dependencies_(broker(), main_zone()),
+         graph_(main_zone()->New<TFGraph>(main_zone())),
+@@ -39,7 +44,7 @@ class ContextSpecializationTester : public HandleAndZoneScope,
+                  &machine_),
+         reducer_(main_zone(), graph(), &tick_counter_, broker()),
+         spec_(&reducer_, jsgraph(), broker(), context,
+-              MaybeHandle<JSFunction>()) {}
++              MaybeHandle<JSFunction>(), osr_context) {}
+   ContextSpecializationTester(Maybe<OuterContext> context,
+                               CanonicalHandles&& handles)
+       : JSHeapBrokerTestBase(main_isolate(), main_zone(), std::move(handles)),
+@@ -151,6 +156,119 @@ Handle<Context> NewCanonicalContextForTesting(ContextSpecializationTester& t,
+ 
+ static const int slot_index = 5;
+ 
++TEST(ReduceGuardedOsrContextByNodeIdentity) {
++  OsrContextSpecialization osr;
++  ContextSpecializationTester t(Nothing<OuterContext>(), &osr);
++  Node* start = t.graph()->NewNode(t.common()->Start(0));
++  t.graph()->SetStart(start);
++  Handle<Context> context = t.CanonicalHandle(*t.factory()->NewNativeContext());
++  DirectHandle<Object> expected =
++      t.CanonicalHandle(*t.factory()->InternalizeUtf8String("guarded"));
++  context->SetNoCell(slot_index, *expected);
++  osr.known_context = context;
++  osr.actual_context = t.graph()->NewNode(t.common()->OsrValue(0), start);
++  Node* sibling = t.graph()->NewNode(t.common()->OsrValue(0), start);
++  Node* closure = t.graph()->NewNode(t.common()->Parameter(-1), start);
++  Node* state = t.graph()->NewNode(
++      t.common()->StateValues(0, SparseInputMask::Dense()));
++  Node* frame_state = t.graph()->NewNode(
++      t.common()->FrameState(BytecodeOffset(0),
++                            OutputFrameStateCombine::Ignore(), nullptr),
++      state, state, state, osr.actual_context, closure, start);
++  Node* load = t.graph()->NewNode(
++      t.javascript()->LoadContextNoCell(0, slot_index, true),
++      osr.actual_context, start);
++  t.CheckChangesToValue(load, Cast<HeapObject>(expected));
++  Node* other_load = t.graph()->NewNode(
++      t.javascript()->LoadContextNoCell(0, slot_index, true), sibling, start);
++  CHECK(!t.spec()->Reduce(other_load).Changed());
++  CHECK(!t.spec()->Reduce(closure).Changed());
++  CHECK(!t.spec()->Reduce(frame_state).Changed());
++  CHECK_EQ(osr.actual_context, frame_state->InputAt(3));
++  CHECK_EQ(closure, frame_state->InputAt(4));
++  context->SetNoCell(slot_index, Smi::zero());
++}
++
++TEST(GuardedOsrContextDynamicRecovery) {
++  FlagScope<bool> natives(&v8_flags.allow_natives_syntax, true);
++  FlagScope<bool> concurrent(&v8_flags.concurrent_recompilation, false);
++  FlagScope<bool> maglev(&v8_flags.maglev, false);
++  LocalContext context;
++  v8::HandleScope handles(context.isolate());
++  v8::Local<v8::Value> result = CompileRun(R"JS(
++    (() => {
++      function check(ok) { if (!ok) throw new Error('OSR context'); }
++      function make(value) {
++        let cell = value;
++        function run(deopt, requireOsr) {
++          check(!%CurrentFrameIsTurbofan());
++          let entered = false;
++          let escaped;
++          for (let i = 0; i < 40; ++i) {
++            if (i === 8) %OptimizeOsr();
++            if (i === 16) {
++              entered = %CurrentFrameIsTurbofan();
++              escaped = () => cell;
++              if (deopt) %DeoptimizeNow();
++            }
++          }
++          if (requireOsr) check(entered);
++          return [cell, escaped(), entered];
++        }
++        %PrepareFunctionForOptimization(run);
++        return {run, set(value) { cell = value; }};
++      }
++      const a = make(23);
++      let result = a.run(false, true);
++      check(result[0] === 23 && result[1] === 23);
++      const object = {};
++      for (const value of [4, 4.2, null, object]) {
++        a.set(value);
++        result = a.run(false, true);
++        check(result[0] === value && result[1] === value);
++      }
++      // Keep a's OSR code alive before creating a second closure of the SFI.
++      const b = make(91);
++      result = b.run(false, false);
++      check(result[0] === 91 && result[1] === 91);
++      // A guard miss may resume unoptimized; the next explicit OSR is generic.
++      for (const current of [b, a, b]) {
++        result = current.run(true, true);
++        const expected = current === a ? object : 91;
++        check(result[0] === expected && result[1] === expected);
++      }
++      function block() {
++        let result = 0;
++        for (let i = 0; i < 30; ++i) {
++          let captured = i;
++          const read = () => captured;
++          if (i === 8) %OptimizeOsr();
++          result += read();
++        }
++        return result;
++      }
++      function caught() {
++        try { throw 17; } catch (value) {
++          let result = 0;
++          for (let i = 0; i < 30; ++i) {
++            if (i === 8) %OptimizeOsr();
++            result += value;
++          }
++          return result;
++        }
++      }
++      %PrepareFunctionForOptimization(block);
++      %PrepareFunctionForOptimization(caught);
++      check(block() === 435 && caught() === 510);
++      return a.run;
++    })()
++  )JS");
++  CHECK(result->IsFunction());
++  DirectHandle<JSFunction> run =
++      Cast<JSFunction>(v8::Utils::OpenHandle(*result));
++  CHECK(run->context()->HasContextCells());
++}
++
+ TEST(ReduceJSLoadContextNoCell0) {
+   ContextSpecializationTester t(Nothing<OuterContext>());
+ 

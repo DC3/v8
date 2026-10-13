@@ -1,0 +1,438 @@
+diff --git a/include/v8-microtask-queue.h b/include/v8-microtask-queue.h
+index 6c0fd739..0924d8f0 100644
+--- a/include/v8-microtask-queue.h
++++ b/include/v8-microtask-queue.h
+@@ -121,6 +121,18 @@ class V8_EXPORT MicrotaskQueue
+    */
+   virtual int GetMicrotasksScopeDepth() const = 0;
+ 
++  /** Explicitly drains this queue, including from an active microtask.
++   * Does not invoke completion callbacks or clear kept objects.
++   */
++  virtual void PerformReentrantCheckpoint(Isolate* isolate) = 0;
++
++  /** Runs after each task.
++   * Passing nullptr disables the callback.
++   */
++  virtual void SetAfterMicrotaskCallback(Isolate* isolate,
++                                         MicrotaskCallback callback,
++                                         void* data = nullptr) = 0;
++
+   MicrotaskQueue(const MicrotaskQueue&) = delete;
+   MicrotaskQueue& operator=(const MicrotaskQueue&) = delete;
+ 
+diff --git a/src/builtins/builtins-definitions.h b/src/builtins/builtins-definitions.h
+index cd7a18b9..d9f45dc3 100644
+--- a/src/builtins/builtins-definitions.h
++++ b/src/builtins/builtins-definitions.h
+@@ -1115,6 +1115,8 @@ constexpr int kGearboxGenericBuiltinIdOffset = -2;
+       kKey)                                                                    \
+   TFJ(ObjectPrototypeIsPrototypeOf, kJSArgcReceiverSlots + 1, kReceiver,       \
+       kValue)                                                                  \
++  CPP(BunModuleNamespaceMarkerGetter, JSParameterCount(0))                     \
++  CPP(BunModuleNamespaceMarkerSetter, JSParameterCount(1))                     \
+   CPP(ObjectPrototypePropertyIsEnumerable, kDontAdaptArgumentsSentinel)        \
+   CPP(ObjectPrototypeGetProto, JSParameterCount(0))                            \
+   CPP(ObjectPrototypeSetProto, JSParameterCount(1))                            \
+diff --git a/src/builtins/builtins-microtask-queue-gen.cc b/src/builtins/builtins-microtask-queue-gen.cc
+index 36f37918..27ca30b9 100644
+--- a/src/builtins/builtins-microtask-queue-gen.cc
++++ b/src/builtins/builtins-microtask-queue-gen.cc
+@@ -855,6 +855,7 @@ TF_BUILTIN(RunMicrotasks, MicrotaskQueueBuiltinsAssembler) {
+   Goto(&loop);
+   BIND(&loop);
+ 
++  // The after-task hook can enqueue tasks or resize the ring; reload state.
+   TNode<IntPtrT> size = GetMicrotaskQueueSize(microtask_queue);
+ 
+   // Exit if the queue is empty.
+@@ -881,6 +882,18 @@ TF_BUILTIN(RunMicrotasks, MicrotaskQueueBuiltinsAssembler) {
+   RunSingleMicrotask(current_context, baseline_entered_context_count,
+                      microtask);
+   IncrementFinishedMicrotaskCount(microtask_queue);
++
++  // Use the regular CallbackTask path so CEntry and current_microtask rooting
++  // also cover an embedder hook that clears itself or reenters the queue.
++  // Only the queued task contributes to the finished count.
++  Label after_tick(this);
++  TNode<Object> tick_task = LoadFullTagged(
++      microtask_queue, IntPtrConstant(MicrotaskQueue::kTickTaskOffset));
++  GotoIf(TaggedEqual(tick_task, SmiConstant(0)), &after_tick);
++  RunSingleMicrotask(current_context, baseline_entered_context_count,
++                     CAST(tick_task));
++  Goto(&after_tick);
++  BIND(&after_tick);
+   Goto(&loop);
+ 
+   BIND(&done);
+diff --git a/src/builtins/builtins-object.cc b/src/builtins/builtins-object.cc
+index 7677d9c3..ec5f2064 100644
+--- a/src/builtins/builtins-object.cc
++++ b/src/builtins/builtins-object.cc
+@@ -8,6 +8,7 @@
+ #include "src/execution/isolate.h"
+ #include "src/objects/keys.h"
+ #include "src/objects/lookup.h"
++#include "src/objects/module-inl.h"
+ #include "src/objects/objects-inl.h"
+ #include "src/objects/property-descriptor.h"
+ #include "src/roots/roots-inl.h"
+@@ -15,6 +16,42 @@
+ namespace v8 {
+ namespace internal {
+ 
++BUILTIN(BunModuleNamespaceMarkerGetter) {
++  HandleScope scope(isolate);
++  DirectHandle<Object> receiver = args.receiver();
++  if (!IsJSModuleNamespace(*receiver) || IsJSDeferredModuleNamespace(*receiver)) {
++    return ReadOnlyRoots(isolate).undefined_value();
++  }
++  DirectHandle<Object> marker = JSReceiver::GetDataProperty(
++      isolate, Cast<JSModuleNamespace>(receiver),
++      isolate->factory()->bun_module_namespace_marker_symbol());
++  if (IsTrue(*marker, isolate)) return ReadOnlyRoots(isolate).true_value();
++  return ReadOnlyRoots(isolate).undefined_value();
++}
++
++BUILTIN(BunModuleNamespaceMarkerSetter) {
++  HandleScope scope(isolate);
++  DirectHandle<Object> receiver = args.receiver();
++  if (!IsJSModuleNamespace(*receiver) || IsJSDeferredModuleNamespace(*receiver)) {
++    return ReadOnlyRoots(isolate).undefined_value();
++  }
++  DirectHandle<JSModuleNamespace> ns = Cast<JSModuleNamespace>(receiver);
++  DirectHandle<Symbol> key =
++      isolate->factory()->bun_module_namespace_marker_symbol();
++  // Only namespaces admitted at creation carry this existing private slot.
++  LookupIterator slot(isolate, ns, key, LookupIterator::OWN_SKIP_INTERCEPTOR);
++  if (slot.state() != LookupIterator::DATA ||
++      !IsBoolean(*slot.GetDataValue())) {
++    return ReadOnlyRoots(isolate).undefined_value();
++  }
++  DirectHandle<Object> marker = direct_handle(
++      Object::ToBoolean(*args.atOrUndefined(isolate, 1), isolate), isolate);
++  // Prototype optimization can migrate the slot from dictionary to fast mode.
++  MAYBE_RETURN(Object::SetDataProperty(&slot, marker),
++               ReadOnlyRoots(isolate).exception());
++  return ReadOnlyRoots(isolate).undefined_value();
++}
++
+ // -----------------------------------------------------------------------------
+ // ES6 section 19.1 Object Objects
+ 
+diff --git a/src/execution/microtask-queue.cc b/src/execution/microtask-queue.cc
+index dfde348a..270cdbee 100644
+--- a/src/execution/microtask-queue.cc
++++ b/src/execution/microtask-queue.cc
+@@ -19,6 +19,7 @@
+ #include "src/execution/isolate-inl.h"
+ #include "src/handles/handle-scope-implementer-inl.h"
+ #include "src/handles/handles-inl.h"
++#include "src/heap/heap-inl.h"
+ #include "src/objects/microtask-inl.h"
+ #include "src/objects/visitors.h"
+ #include "src/roots/roots-inl.h"
+@@ -35,6 +36,8 @@ const size_t MicrotaskQueue::kSizeOffset = OFFSET_OF(MicrotaskQueue, size_);
+ const size_t MicrotaskQueue::kStartOffset = OFFSET_OF(MicrotaskQueue, start_);
+ const size_t MicrotaskQueue::kFinishedMicrotaskCountOffset =
+     OFFSET_OF(MicrotaskQueue, finished_microtask_count_);
++const size_t MicrotaskQueue::kTickTaskOffset =
++    OFFSET_OF(MicrotaskQueue, tick_task_);
+ 
+ const intptr_t MicrotaskQueue::kMinimumCapacity = 8;
+ 
+@@ -150,6 +153,38 @@ void MicrotaskQueue::EnqueueMicrotask(v8::Isolate* v8_isolate,
+   EnqueueMicrotask(*microtask);
+ }
+ 
++void MicrotaskQueue::SetAfterMicrotaskCallback(v8::Isolate* v8_isolate,
++                                               v8::MicrotaskCallback callback,
++                                               void* data) {
++  if (callback == nullptr) {
++    tick_task_ = 0;
++    return;
++  }
++  Isolate* isolate = reinterpret_cast<Isolate*>(v8_isolate);
++  HandleScope scope(isolate);
++  DirectHandle<CallbackTask> task = isolate->factory()->NewCallbackTask(
++      isolate->factory()->NewForeign<kMicrotaskCallbackTag>(
++          reinterpret_cast<Address>(callback)),
++      isolate->factory()->NewForeign<kMicrotaskCallbackDataTag>(
++          reinterpret_cast<Address>(data)));
++  tick_task_ = task->ptr();
++}
++
++void MicrotaskQueue::PerformReentrantCheckpoint(v8::Isolate* v8_isolate) {
++  Isolate* isolate = reinterpret_cast<Isolate*>(v8_isolate);
++  if (isolate->is_execution_terminating()) {
++    tick_task_ = 0;
++    return;
++  }
++  std::optional<MicrotasksScope> microtasks_scope;
++  if (microtasks_policy_ == v8::MicrotasksPolicy::kScoped) {
++    microtasks_scope.emplace(v8_isolate, this,
++                             v8::MicrotasksScope::kDoNotRunMicrotasks);
++  }
++  // Explicit drains do not complete the outer checkpoint or clear kept objects.
++  RunMicrotasks(isolate, RunMode::kExplicit);
++}
++
+ void MicrotaskQueue::EnqueueMicrotask(Tagged<Microtask> microtask) {
+   if (size_ == capacity_) {
+     // Keep the capacity of |ring_buffer_| power of 2, so that the JIT
+@@ -191,29 +226,36 @@ namespace {
+ 
+ class SetIsRunningMicrotasks {
+  public:
+-  explicit SetIsRunningMicrotasks(bool* flag) : flag_(flag) {
+-    DCHECK(!*flag_);
++  SetIsRunningMicrotasks(bool* flag, bool allow_reentrant)
++      : flag_(flag), previous_(*flag) {
++    DCHECK(allow_reentrant || !previous_);
+     *flag_ = true;
+   }
+ 
+   ~SetIsRunningMicrotasks() {
+     DCHECK(*flag_);
+-    *flag_ = false;
++    *flag_ = previous_;
+   }
+ 
+  private:
+   bool* flag_;
++  bool previous_;
+ };
+ 
+ }  // namespace
+ 
+-int MicrotaskQueue::RunMicrotasks(Isolate* isolate) {
+-  SetIsRunningMicrotasks scope(&is_running_microtasks_);
++int MicrotaskQueue::RunMicrotasks(Isolate* isolate, RunMode mode) {
++  const bool explicit_drain = mode == RunMode::kExplicit;
++  if (isolate->is_execution_terminating()) {
++    tick_task_ = 0;
++    return -1;
++  }
++  SetIsRunningMicrotasks scope(&is_running_microtasks_, explicit_drain);
+   v8::Isolate::SuppressMicrotaskExecutionScope suppress(
+       reinterpret_cast<v8::Isolate*>(isolate), this);
+ 
+   if (!size()) {
+-    OnCompleted(isolate);
++    if (!explicit_drain) OnCompleted(isolate);
+     return 0;
+   }
+ 
+@@ -224,6 +266,11 @@ int MicrotaskQueue::RunMicrotasks(Isolate* isolate) {
+ 
+   intptr_t base_count = finished_microtask_count_;
+   HandleScope handle_scope(isolate);
++  Handle<HeapObject> saved_current_microtask;
++  if (explicit_drain) {
++    saved_current_microtask =
++        handle(isolate->heap()->current_microtask(), isolate);
++  }
+   MaybeDirectHandle<Object> maybe_result;
+ 
+ #ifdef V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+@@ -260,18 +307,33 @@ int MicrotaskQueue::RunMicrotasks(Isolate* isolate) {
+     capacity_ = 0;
+     size_ = 0;
+     start_ = 0;
++    tick_task_ = 0;
+     isolate->OnTerminationDuringRunMicrotasks();
+-    OnCompleted(isolate);
++    if (explicit_drain) {
++      isolate->roots_table().slot(RootIndex::kCurrentMicrotask).store(
++          *saved_current_microtask);
++    } else {
++      OnCompleted(isolate);
++    }
+     return -1;
+   }
+ 
+   DCHECK_EQ(0, size());
+-  OnCompleted(isolate);
++  if (explicit_drain) {
++    isolate->roots_table().slot(RootIndex::kCurrentMicrotask).store(
++        *saved_current_microtask);
++  } else {
++    OnCompleted(isolate);
++  }
+ 
+   return processed_microtask_count;
+ }
+ 
+ void MicrotaskQueue::IterateMicrotasks(RootVisitor* visitor) {
++  if (tick_task_ != 0) {
++    visitor->VisitRootPointer(Root::kMicroTasks, nullptr,
++                             FullObjectSlot(&tick_task_));
++  }
+   if (size_) {
+     // Iterate pending Microtasks as root objects to avoid the write barrier for
+     // all single Microtask. If this hurts the GC performance, use a FixedArray.
+diff --git a/src/execution/microtask-queue.h b/src/execution/microtask-queue.h
+index becdf0e0..ac7cd73d 100644
+--- a/src/execution/microtask-queue.h
++++ b/src/execution/microtask-queue.h
+@@ -59,6 +59,10 @@ class V8_EXPORT_PRIVATE MicrotaskQueue final : public v8::MicrotaskQueue {
+                         v8::Local<Function> microtask) override;
+   void EnqueueMicrotask(v8::Isolate* isolate, v8::MicrotaskCallback callback,
+                         void* data) override;
++  void SetAfterMicrotaskCallback(v8::Isolate* isolate,
++                                  v8::MicrotaskCallback callback,
++                                  void* data) override;
++  void PerformReentrantCheckpoint(v8::Isolate* isolate) override;
+   void EnqueueMicrotask(v8::Isolate* isolate,
+                         v8::MicrotaskCallbackWithData callback,
+                         v8::Local<v8::Data> data) override;
+@@ -79,7 +83,8 @@ class V8_EXPORT_PRIVATE MicrotaskQueue final : public v8::MicrotaskQueue {
+   // Runs all queued Microtasks.
+   // Returns -1 if the execution is terminating, otherwise, returns the number
+   // of microtasks that ran in this round.
+-  int RunMicrotasks(Isolate* isolate);
++  enum class RunMode { kDefault, kExplicit };
++  int RunMicrotasks(Isolate* isolate, RunMode mode = RunMode::kDefault);
+ 
+   // Iterate all pending Microtasks in this queue as strong roots, so that
+   // builtins can update the queue directly without the write barrier.
+@@ -133,6 +138,7 @@ class V8_EXPORT_PRIVATE MicrotaskQueue final : public v8::MicrotaskQueue {
+   static const size_t kSizeOffset;
+   static const size_t kStartOffset;
+   static const size_t kFinishedMicrotaskCountOffset;
++  static const size_t kTickTaskOffset;
+ 
+   static const intptr_t kMinimumCapacity;
+ 
+@@ -154,6 +160,9 @@ class V8_EXPORT_PRIVATE MicrotaskQueue final : public v8::MicrotaskQueue {
+   intptr_t start_ = 0;
+   Address* ring_buffer_ = nullptr;
+ 
++  // A full tagged CallbackTask, or zero when the after-task hook is disabled.
++  Address tick_task_ = 0;
++
+   // The number of finished microtask.
+   intptr_t finished_microtask_count_ = 0;
+ 
+diff --git a/src/flags/flag-definitions.h b/src/flags/flag-definitions.h
+index 070772ee..05623942 100644
+--- a/src/flags/flag-definitions.h
++++ b/src/flags/flag-definitions.h
+@@ -3354,6 +3354,8 @@ DEFINE_REQUIREMENT(
+ DEFINE_IMPLICATION(future, homomorphic_ic)
+ 
+ // objects.cc
++DEFINE_BOOL(bun_module_namespace_marker, false,
++            "enable Bun's inherited per-module __esModule marker")
+ DEFINE_DEVELOPER_FLAG(trace_prototype_users,
+                       "Trace updates to prototype user tracking")
+ DEFINE_DEVELOPER_FLAG(trace_for_in_enumerate,
+diff --git a/src/init/heap-symbols.h b/src/init/heap-symbols.h
+index 45a1ee29..da6ee373 100644
+--- a/src/init/heap-symbols.h
++++ b/src/init/heap-symbols.h
+@@ -903,6 +903,7 @@
+   V(_, mega_dom_symbol)
+ 
+ #define NOT_IMPORTANT_PRIVATE_SYMBOL_LIST_GENERATOR(V, _) \
++  V(_, bun_module_namespace_marker_symbol)                 \
+   V(_, array_buffer_wasm_memory_symbol)                   \
+   V(_, call_site_info_symbol)                             \
+   V(_, class_fields_symbol)                               \
+diff --git a/src/objects/module.cc b/src/objects/module.cc
+index 1865ea0a..31453497 100644
+--- a/src/objects/module.cc
++++ b/src/objects/module.cc
+@@ -11,6 +11,7 @@
+ #include "src/api/api-inl.h"
+ #include "src/ast/modules.h"
+ #include "src/builtins/accessors.h"
++#include "src/builtins/builtins.h"
+ #include "src/common/assert-scope.h"
+ #include "src/heap/heap-inl.h"
+ #include "src/logging/counters.h"
+@@ -20,6 +21,7 @@
+ #include "src/objects/module-inl.h"
+ #include "src/objects/object-predicates-inl.h"
+ #include "src/objects/property-descriptor.h"
++#include "src/objects/shared-function-info-inl.h"
+ #include "src/objects/source-text-module.h"
+ #include "src/objects/synthetic-module-inl.h"
+ #include "src/utils/ostreams.h"
+@@ -398,6 +400,36 @@ DirectHandle<JSModuleNamespace> Module::GetModuleNamespace(
+                      ComparisonResult::kLessThan;
+             });
+ 
++  // Install lazily, after snapshot deserialization, and only for evaluation
++  // namespaces. The existing context map caches the shared isolated prototype.
++  if (v8_flags.bun_module_namespace_marker &&
++      phase == ModuleImportPhase::kEvaluation &&
++      IsNull(isolate->js_module_namespace_map()->prototype(), isolate)) {
++    Factory* factory = isolate->factory();
++    DirectHandle<JSObject> prototype = factory->NewSlowJSObjectWithNullProto();
++    auto make_accessor = [&](const char* name, Builtin builtin, int length) {
++      DirectHandle<SharedFunctionInfo> info =
++          factory->NewSharedFunctionInfoForBuiltin(
++              factory->InternalizeUtf8String(name), builtin, length, kAdapt);
++      info->set_language_mode(LanguageMode::kStrict);
++      return Factory::JSFunctionBuilder{isolate, info, isolate->native_context()}
++          .set_map(isolate->strict_function_without_prototype_map())
++          .Build();
++    };
++    DirectHandle<JSFunction> getter = make_accessor(
++        "get __esModule", Builtin::kBunModuleNamespaceMarkerGetter, 0);
++    DirectHandle<JSFunction> setter = make_accessor(
++        "set __esModule", Builtin::kBunModuleNamespaceMarkerSetter, 1);
++    JSObject::DefineOwnAccessorIgnoreAttributes(
++        prototype, factory->InternalizeUtf8String("__esModule"), getter, setter,
++        static_cast<PropertyAttributes>(DONT_ENUM | DONT_DELETE))
++        .Check();
++    DirectHandle<Map> map = Map::Copy(
++        isolate, isolate->js_module_namespace_map(), "BunModuleNamespace");
++    Map::SetPrototype(isolate, map, prototype);
++    isolate->native_context()->set_js_module_namespace_map(*map);
++  }
++
+   // Create the namespace object (initially empty).
+   DirectHandle<JSModuleNamespace> ns =
+       phase == ModuleImportPhase::kEvaluation
+@@ -430,6 +462,16 @@ DirectHandle<JSModuleNamespace> Module::GetModuleNamespace(
+           .Check();
+     }
+   }
++  if (v8_flags.bun_module_namespace_marker &&
++      phase == ModuleImportPhase::kEvaluation) {
++    JSObject::SetNormalizedProperty(
++        ns, isolate->factory()->bun_module_namespace_marker_symbol(),
++        isolate->factory()->false_value(),
++        PropertyDetails(
++            PropertyKind::kData,
++            static_cast<PropertyAttributes>(DONT_ENUM | DONT_DELETE),
++            PropertyCellType::kMutable));
++  }
+   JSObject::PreventExtensions(isolate, ns, kThrowOnError).ToChecked();
+ 
+   // Optimize the namespace object as a prototype, for two reasons:
+diff --git a/src/objects/objects.cc b/src/objects/objects.cc
+index a8d6b274..beaf9e65 100644
+--- a/src/objects/objects.cc
++++ b/src/objects/objects.cc
+@@ -2487,6 +2487,18 @@ Maybe<bool> Object::SetPropertyInternal(LookupIterator* it,
+       }
+       case LookupIterator::MODULE_NAMESPACE: {
+         Isolate* isolate = it->isolate();
++        if (v8_flags.bun_module_namespace_marker && !it->IsElement() &&
++            IsJSModuleNamespace(*it->GetReceiver()) &&
++            !IsJSDeferredModuleNamespace(*it->GetReceiver()) &&
++            !IsJSDeferredModuleNamespace(*it->GetHolder<JSModuleNamespace>()) &&
++            Name::Equals(isolate, it->GetName(),
++                         isolate->factory()->InternalizeUtf8String(
++                             "__esModule")) &&
++            !it->GetHolder<JSModuleNamespace>()->HasExport(
++                isolate, Cast<String>(it->GetName()))) {
++          // Preserve the receiver through the ordinary inherited AccessorPair.
++          continue;
++        }
+         RETURN_FAILURE(isolate, GetShouldThrow(isolate, should_throw),
+                        NewTypeError(MessageTemplate::kStrictCannotSetProperty,
+                                     it->GetName(), it->GetReceiver()));

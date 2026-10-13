@@ -1,0 +1,228 @@
+--- a/include/v8-fast-api-calls.h
++++ b/include/v8-fast-api-calls.h
+@@ -308,6 +308,20 @@
+     kBigInt = 1,  // Use BigInts to represent 64 bit integers.
+   };
+ 
++  // Whether the C function takes a JS receiver as its first argument.
++  // Most fast-call C functions do (matching how V8 wires up
++  // FunctionTemplate callbacks). Embedders that want to register a plain
++  // C function pointer -- e.g. an FFI dispatcher that has no use for the
++  // receiver -- can set this to kNo. In that mode V8 omits the receiver
++  // from the C call: arg_info[0] is the first user argument,
++  // ArgumentCount() returns the user-arg count, and the JS receiver
++  // value is discarded by the lowering instead of being passed in the
++  // first parameter register.
++  enum class HasReceiver : uint8_t {
++    kYes = 0,
++    kNo = 1,
++  };
++
+   // Construct a struct to hold a CFunction's type information.
+   // |return_info| describes the function's return type.
+   // |arg_info| is an array of |arg_count| CTypeInfos describing the
+@@ -315,7 +329,8 @@
+   //   CTypeInfo::kCallbackOptionsType.
+   CFunctionInfo(const CTypeInfo& return_info, unsigned int arg_count,
+                 const CTypeInfo* arg_info,
+-                Int64Representation repr = Int64Representation::kNumber);
++                Int64Representation repr = Int64Representation::kNumber,
++                HasReceiver has_receiver = HasReceiver::kYes);
+ 
+   const CTypeInfo& ReturnInfo() const { return return_info_; }
+ 
+@@ -327,6 +342,9 @@
+ 
+   Int64Representation GetInt64Representation() const { return repr_; }
+ 
++  // See the HasReceiver comment above.
++  bool HasReceiverArg() const { return has_receiver_ == HasReceiver::kYes; }
++
+   // |index| must be less than ArgumentCount().
+   //  Note: if the last argument passed on construction of CFunctionInfo
+   //  has type CTypeInfo::kCallbackOptionsType, it is not included in
+@@ -342,6 +360,7 @@
+  private:
+   const CTypeInfo return_info_;
+   const Int64Representation repr_;
++  const HasReceiver has_receiver_;
+   const unsigned int arg_count_;
+   const CTypeInfo* arg_info_;
+ };
+--- a/src/api/api.cc
++++ b/src/api/api.cc
+@@ -12222,9 +12222,11 @@
+ 
+ CFunctionInfo::CFunctionInfo(const CTypeInfo& return_info,
+                              unsigned int arg_count, const CTypeInfo* arg_info,
+-                             Int64Representation repr)
++                             Int64Representation repr,
++                             HasReceiver has_receiver)
+     : return_info_(return_info),
+       repr_(repr),
++      has_receiver_(has_receiver),
+       arg_count_(arg_count),
+       arg_info_(arg_info) {
+   DCHECK(repr == Int64Representation::kNumber ||
+--- a/src/compiler/fast-api-calls.cc
++++ b/src/compiler/fast-api-calls.cc
+@@ -387,10 +387,13 @@
+       function_template_info.c_functions_with_signatures(broker);
+   const size_t overloads_count = overloads.size();
+ 
+-  // Only considers entries whose type list length matches arg_count.
++  // Only considers entries whose type list length matches arg_count. For
++  // signatures registered with HasReceiver::kNo, the C-side ArgumentCount
++  // already excludes the receiver, so don't subtract it again here.
+   for (size_t i = 0; i < overloads_count; i++) {
+     const CFunctionInfo* c_signature = overloads[i].signature;
+-    const size_t len = c_signature->ArgumentCount() - kReceiver;
++    const size_t len = c_signature->ArgumentCount() -
++                        (c_signature->HasReceiverArg() ? kReceiver : 0);
+     bool optimize_to_fast_call =
+         (len == arg_count) &&
+         fast_api_call::CanOptimizeFastSignature(c_signature);
+--- a/src/compiler/js-call-reducer.cc
++++ b/src/compiler/js-call-reducer.cc
+@@ -676,7 +676,14 @@
+     // arguments, so extract c_argument_count from the first function.
+     const int c_argument_count =
+         static_cast<int>(c_function_.signature->ArgumentCount());
+-    CHECK_GE(c_argument_count, kReceiver);
++    // HasReceiver::kNo signatures never included the receiver in
++    // ArgumentCount() in the first place, so there's nothing to check or
++    // subtract on that path -- see the HasReceiver comment in
++    // v8-fast-api-calls.h.
++    const bool has_receiver_arg = c_function_.signature->HasReceiverArg();
++    if (has_receiver_arg) {
++      CHECK_GE(c_argument_count, kReceiver);
++    }
+ 
+     const int slow_arg_count =
+         // Arguments for CallApiCallbackOptimizedXXX builtin including
+@@ -691,11 +698,13 @@
+     base::SmallVector<Node*, kInlineSize> inputs(value_input_count +
+                                                  kEffectAndControl);
+     int cursor = 0;
+-    inputs[cursor++] = receiver_;
++    if (has_receiver_arg) {
++      inputs[cursor++] = receiver_;
++    }
+ 
+     // TODO(turbofan): Consider refactoring CFunctionInfo to distinguish
+     // between receiver and arguments, simplifying this (and related) spots.
+-    int js_args_count = c_argument_count - kReceiver;
++    int js_args_count = c_argument_count - (has_receiver_arg ? kReceiver : 0);
+     for (int i = 0; i < js_args_count; ++i) {
+       if (i < n.ArgumentCount()) {
+         inputs[cursor++] = n.Argument(i);
+diff --git a/test/cctest/test-api.cc b/test/cctest/test-api.cc
+index 3518564c..17711879 100644
+--- a/test/cctest/test-api.cc
++++ b/test/cctest/test-api.cc
+@@ -29825,6 +29825,105 @@ TEST(FastApiStackSlot) {
+ #endif  // !defined(V8_LITE_MODE) && defined(V8_ENABLE_TURBOFAN)
+ }
+ 
++TEST(FastApiCallsWithoutReceiver) {
++#if !defined(V8_LITE_MODE) && defined(V8_ENABLE_TURBOFAN) && \
++    !defined(USE_SIMULATOR)
++  if (i::v8_flags.jitless || i::v8_flags.disable_optimizing_compilers) return;
++  i::FlagScope<bool> fast_api(&i::v8_flags.turbo_fast_api_calls, true);
++  i::FlagScope<bool> natives(&i::v8_flags.allow_natives_syntax, true);
++  i::FlagScope<bool> concurrent(&i::v8_flags.concurrent_recompilation, false);
++
++  CcTest::InitializeVM();
++  v8::Isolate* isolate = CcTest::isolate();
++  v8::HandleScope scope(isolate);
++  LocalContext env;
++  static int noop_fast, noop_slow, identity_fast, identity_slow;
++  noop_fast = noop_slow = identity_fast = identity_slow = 0;
++  static const v8::CFunctionInfo noop_info(
++      v8::CTypeInfo(v8::CTypeInfo::Type::kVoid), 0, nullptr,
++      v8::CFunctionInfo::Int64Representation::kNumber,
++      v8::CFunctionInfo::HasReceiver::kNo);
++  static const v8::CTypeInfo identity_args[] = {
++      v8::CTypeInfo(v8::CTypeInfo::Type::kInt32)};
++  static const v8::CFunctionInfo identity_info(
++      v8::CTypeInfo(v8::CTypeInfo::Type::kInt32), 1, identity_args,
++      v8::CFunctionInfo::Int64Representation::kNumber,
++      v8::CFunctionInfo::HasReceiver::kNo);
++  v8::CFunction noop_c_function(
++      reinterpret_cast<const void*>(+[]() { ++noop_fast; }), &noop_info);
++  v8::CFunction identity_c_function(
++      reinterpret_cast<const void*>(+[](int32_t value) -> int32_t {
++        ++identity_fast;
++        return value;
++      }),
++      &identity_info);
++  CHECK_EQ(0, noop_c_function.ArgumentCount());
++  CHECK_EQ(1, identity_c_function.ArgumentCount());
++  CHECK(!noop_info.HasReceiverArg());
++  CHECK(!identity_info.HasReceiverArg());
++
++  Local<v8::ObjectTemplate> object_template = v8::ObjectTemplate::New(isolate);
++  object_template->Set(
++      isolate, "noop",
++      v8::FunctionTemplate::New(
++          isolate,
++          [](const v8::FunctionCallbackInfo<v8::Value>& info) {
++            CHECK(i::ValidateCallbackInfo(info));
++            ++noop_slow;
++          },
++          Local<Value>(), Local<v8::Signature>(), 0,
++          v8::ConstructorBehavior::kThrow, v8::SideEffectType::kHasSideEffect,
++          &noop_c_function));
++  object_template->Set(
++      isolate, "identity",
++      v8::FunctionTemplate::New(
++          isolate,
++          [](const v8::FunctionCallbackInfo<v8::Value>& info) {
++            CHECK(i::ValidateCallbackInfo(info));
++            ++identity_slow;
++            info.GetReturnValue().Set(
++                info[0]->Int32Value(info.GetIsolate()->GetCurrentContext())
++                    .FromJust());
++          },
++          Local<Value>(), Local<v8::Signature>(), 1,
++          v8::ConstructorBehavior::kThrow, v8::SideEffectType::kHasSideEffect,
++          &identity_c_function));
++  CHECK(env->Global()
++            ->Set(env.local(), v8_str("receiverless"),
++                  object_template->NewInstance(env.local()).ToLocalChecked())
++            .FromJust());
++  CompileRun(R"JS(
++    function callNoop() { return receiverless.noop(); }
++    function callIdentity(value) { return receiverless.identity(value); }
++    %PrepareFunctionForOptimization(callNoop);
++    %PrepareFunctionForOptimization(callIdentity);
++    callNoop(); callNoop();
++    callIdentity(31); callIdentity(31);
++    %OptimizeFunctionOnNextCall(callNoop);
++    %OptimizeFunctionOnNextCall(callIdentity);
++  )JS");
++  CHECK_GT(noop_slow, 0);
++  CHECK_GT(identity_slow, 0);
++  noop_fast = noop_slow = identity_fast = identity_slow = 0;
++  CHECK(CompileRun("callNoop()")->IsUndefined());
++  CHECK_EQ(31, CompileRun("callIdentity(31)")->Int32Value(env.local()).FromJust());
++  CHECK_EQ(std::numeric_limits<int32_t>::min(),
++           CompileRun("callIdentity(-2147483648)")
++               ->Int32Value(env.local()).FromJust());
++  CHECK_EQ(std::numeric_limits<int32_t>::max(),
++           CompileRun("callIdentity(2147483647)")
++               ->Int32Value(env.local()).FromJust());
++  CHECK_EQ(1, noop_fast);
++  CHECK_EQ(3, identity_fast);
++  CHECK_EQ(0, noop_slow);
++  CHECK_EQ(0, identity_slow);
++  CHECK_EQ(31, CompileRun("callIdentity('31')")
++                   ->Int32Value(env.local()).FromJust());
++  CHECK_EQ(3, identity_fast);
++  CHECK_EQ(1, identity_slow);
++#endif
++}
++
+ TEST(FastApiCalls) {
+ #if !defined(V8_LITE_MODE) && defined(V8_ENABLE_TURBOFAN)
+   if (i::v8_flags.jitless) return;
