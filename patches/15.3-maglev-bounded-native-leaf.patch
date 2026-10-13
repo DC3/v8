@@ -156,6 +156,25 @@ index 88ede661..6831d2a2 100644
    return AddNewNode<CallKnownApiFunction>(
        input_count,
        [&](CallKnownApiFunction* call) {
+diff --git a/src/maglev/maglev-graph-optimizer.cc b/src/maglev/maglev-graph-optimizer.cc
+index ed5c04bf..e3dc1546 100644
+--- a/src/maglev/maglev-graph-optimizer.cc
++++ b/src/maglev/maglev-graph-optimizer.cc
+@@ -1757,6 +1757,14 @@ ProcessResult MaglevGraphOptimizer::VisitCallKnownApiFunction(
+   return ProcessResult::kContinue;
+ }
+ 
++#if defined(V8_TARGET_ARCH_X64) && V8_OS_LINUX && !defined(USE_SIMULATOR)
++ProcessResult MaglevGraphOptimizer::VisitCallBoundedNative(
++    CallBoundedNative* node, const ProcessingState& state) {
++  // Preserve the native call and its ordinary memory effects.
++  return ProcessResult::kContinue;
++}
++#endif
++
+ ProcessResult MaglevGraphOptimizer::VisitCallKnownJSFunction(
+     CallKnownJSFunction* node, const ProcessingState& state) {
+   // TODO(b/424157317): Optimize.
 diff --git a/src/maglev/maglev-ir.h b/src/maglev/maglev-ir.h
 index c5a3a5b0..bb7293e5 100644
 --- a/src/maglev/maglev-ir.h

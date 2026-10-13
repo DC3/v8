@@ -1,5 +1,12 @@
 # 变更记录
 
+## [2026-10-13] 为本地 full seed 构建增加可选持久缓存
+
+- 支持显式绝对路径 LOBUN_V8_BUILD_CACHE，复用固定 revision 的 depot_tools、V8 源码、gclient 依赖、Clang/Rust 和 Ninja 输出；未设置时保留 GitHub 原有 scratch 构建。seed、build-info 和最终包仍由本次独立输出生成。
+- 缓存入口拒绝路径重叠、未知 revision、暂存修改、新未跟踪源码及实际 diff 与记录不符。用 gclient 原生 DEPS 映射核对每个 Git 子仓的 HEAD、origin 与工作区；每轮仍受控 sync 完整包依赖和 hooks，复用已有下载。仅保存当前可逆 .applied.patch 和四份补丁原文；相同补丁不反向或重应用，补丁变化时先核对再恢复，不执行 reset。
+- 既有 Ninja 输出限定同一 GN 参数及固定依赖闭包，仅允许 C++ .cc/.h 补丁；配置或构建图变化要求新缓存目录，保留旧目录，防止打包混入旧 Rust archive。相同参数不重写；每次执行 GN、三个 Ninja 目标和全部 30 项 native 门禁，不缓存 PASS。中断的不一致状态拒绝自动恢复；仅静态检查，真实缓存复用与 native 全链路验收待主控执行。
+- 首轮 GitHub 与本地 CI 均因缺少 MaglevGraphOptimizer::VisitCallBoundedNative 定义而在 mksnapshot 链接失败；另行补齐 8 行 visitor，保留调用及内存副作用，已通过非作者源码审查，修复后的真实 CI 仍待复跑验收。
+
 ## [2026-10-13] 实施受限 bounded native leaf 的 Maglev 候选
 
 - 新增逐 callee 不可变、默认关闭的 NativeCallContract；仅显式承诺有界、不阻塞、不触 VM/GC/JS 重入的静态 native void()/i32(i32) 可进入新路径，不修改同签名共享 builder 实例。
