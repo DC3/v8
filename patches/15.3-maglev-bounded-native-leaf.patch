@@ -321,7 +321,7 @@ index cca74ccc..44fc024b 100644
    return MaglevAssembler::ArgumentStackSlotsForCFunctionCall(1);
  }
 diff --git a/test/cctest/test-api.cc b/test/cctest/test-api.cc
-index 17711879..8a932306 100644
+index 17711879..5d3ca260 100644
 --- a/test/cctest/test-api.cc
 +++ b/test/cctest/test-api.cc
 @@ -28,8 +28,10 @@
@@ -343,7 +343,7 @@ index 17711879..8a932306 100644
  #include "src/objects/feedback-vector-inl.h"
  #include "src/objects/feedback-vector.h"
  #include "src/objects/hash-table-inl.h"
-@@ -29924,6 +29927,421 @@ TEST(FastApiCallsWithoutReceiver) {
+@@ -29924,6 +29927,423 @@ TEST(FastApiCallsWithoutReceiver) {
  #endif
  }
  
@@ -667,6 +667,8 @@ index 17711879..8a932306 100644
 +  LocalContext env;
 +  flags.Install(env.local());
 +  CompileRun(R"JS(
++    %PrepareFunctionForOptimization(strictIdentity);
++    strictIdentity(1); strictIdentity(2);
 +    function overflow(value) { return boundedIdentity(value) + 1; }
 +    function overflowStrict(value) { return strictIdentity(value) + 1; }
 +    function afterLeaf(value) {

@@ -1,5 +1,10 @@
 # 变更记录
 
+## [2026-10-14] 准备真实内联 deopt 回归的 callee feedback
+
+- Forgejo106完整构建与原27项native、新增基础Maglev通过，deopt回归的真实内联断言失败；既有inlining trace确认identity尚无反馈，新增显式准备与两次callee预热。
+- 保真实内联、溢出、GC/lazy deopt与exactly-once计数断言和重置位置；仅测试两行修改经独审，实际全30与产物仍待新CI，不宣性能结果。
+
 ## [2026-10-14] 修正相同补丁缓存的 gclient 同步模式
 
 - Forgejo105 在依赖同步阶段因强制指定 V8 revision 而拒绝已有补丁的工作区，尚未进入 native 构建。仅对已核验且四份补丁逐字相同的缓存省略 revision 覆盖，沿既有 managed=False 保持 V8 根 HEAD；初建或补丁变化恢复干净源码后仍显式固定 revision。
