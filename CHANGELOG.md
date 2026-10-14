@@ -1,5 +1,10 @@
 # 变更记录
 
+## [2026-10-14] 修正 bounded native 永久回归的 V8 15.3 接线
+
+- Forgejo104 已越过 optimizer visitor 链接缺口，后在 test-api 的 Context::GetIsolate 编译失败；改为同版 LocalContext 默认使用的 CcTest::isolate，保留局部 HandleScope 和全部原生断言。
+- 单行差异已重新独审，昨日候选关键边界另行复核；缓存、完整构建目标、30项 native 与原消费门禁保持，修复后真实结果待验收。
+
 ## [2026-10-13] 为本地 full seed 构建增加可选持久缓存
 
 - 支持显式绝对路径 LOBUN_V8_BUILD_CACHE，复用固定 revision 的 depot_tools、V8 源码、gclient 依赖、Clang/Rust 和 Ninja 输出；未设置时保留 GitHub 原有 scratch 构建。seed、build-info 和最终包仍由本次独立输出生成。

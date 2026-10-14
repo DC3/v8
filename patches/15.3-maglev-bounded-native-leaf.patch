@@ -321,7 +321,7 @@ index cca74ccc..44fc024b 100644
    return MaglevAssembler::ArgumentStackSlotsForCFunctionCall(1);
  }
 diff --git a/test/cctest/test-api.cc b/test/cctest/test-api.cc
-index 17711879..1cf1a72f 100644
+index 17711879..8a932306 100644
 --- a/test/cctest/test-api.cc
 +++ b/test/cctest/test-api.cc
 @@ -28,8 +28,10 @@
@@ -459,7 +459,7 @@ index 17711879..1cf1a72f 100644
 +  }
 +
 +  void Install(v8::Local<v8::Context> context) {
-+    v8::Isolate* isolate = context->GetIsolate();
++    v8::Isolate* isolate = CcTest::isolate();
 +    v8::HandleScope scope(isolate);
 +    static const v8::CTypeInfo arguments[] = {
 +        v8::CTypeInfo(v8::CTypeInfo::Type::kV8Value),
