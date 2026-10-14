@@ -1,5 +1,11 @@
 # 变更记录
 
+## [2026-10-14] 撤回未命中机械目标的 callee-saved GP 实验
+
+- Forgejo117/API821完整36 native通过，单cache仅unit对象+链接2目标、27秒；消费者百万43M正确。实际sample TF628B，但checksum栈reload仍在、index变每轮寄存器传送，两FrameState store保持，机械独审REJECT，不推收益或退化。
+- 按冻结停止条件停止大suite/原三门禁/ABBA；patch/script/README精确恢复30a15同内容，原34与mtime保留，core/index闭包非作者恢复审查通过。不重复dispatch同内容恢复，历史778通过不冒新headCI绿。
+- 唯一候选tar/raw/seed/runtime四目标经精确UID/Git/inode/process/container审核后清理，只保124KB机器码及小结论；Btrfs167.61MiB独占不是宿主净回收，保护713/A/778/单cache和父目录。
+
 ## [2026-10-14] 修正 callee-saved 单测的固定端点预期
 
 - Forgejo116/API818完整编译、原34及新增真实TF/GC/deopt共35项通过；第36项regalloc仅RBX位置断言失败，未打包或消费候选产物。现有binary单次诊断重复同一失败，trace未给出具体寄存器重定位，不宣生产故障或新PASS。
