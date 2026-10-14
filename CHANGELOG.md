@@ -1,5 +1,11 @@
 # 变更记录
 
+## [2026-10-14] 实验内联前受限 OSR 循环剥离
+
+- 原713实际图显示严格wrapper冷Throw出口阻止late peeling；保原wrapper/callee/effects/调用安全状态，新增普通TF、OSR及原peeling开启时的窄earlyphase，复用trivial Phi清理、cached-root trimming、LoopFinder与Peel(loop)。
+- 限单一无嵌套、单回边、原1000预算及完整CanPeel，失败走原流程；原Inlining/Typer/late顺序与预算不变。补标准runtime-call-stats条目，不关闭统计；不承诺late全程只剥一次。
+- 原32 native逐项保留，新增2项永久OSR边界/GC/lazydeopt/终止恢复回归，总34项通过才产包。生产源码已独审，组合源码及真实构建、消费图、原性能门禁仍待验收，不宣收益。
+
 ## [2026-10-14] 撤回未证收益的 TF 异常后检削减
 
 - 前一候选真实32 native、runtime394测试和原三门禁通过，但预定ABBA的identity表观改善12.7%小于未改pointer的14.8%，控制组自身漂移超过30%；独立复算INCONCLUSIVE，不追加同候选采样。

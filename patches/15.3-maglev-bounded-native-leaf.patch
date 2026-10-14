@@ -73,6 +73,93 @@ index 61da1c48..6feff367 100644
        arg_count_(arg_count),
        arg_info_(arg_info) {
    DCHECK(repr == Int64Representation::kNumber ||
+diff --git a/src/compiler/pipeline.cc b/src/compiler/pipeline.cc
+index 8605bf97..d7f5b2f7 100644
+--- a/src/compiler/pipeline.cc
++++ b/src/compiler/pipeline.cc
+@@ -916,6 +916,70 @@ struct GraphBuilderPhase {
+   }
+ };
+ 
++struct EarlyOsrLoopPeelingPhase {
++  DECL_PIPELINE_PHASE_CONSTANTS(EarlyOsrLoopPeeling)
++
++  void Run(TFPipelineData* data, Zone* temp_zone) {
++    GraphReducer graph_reducer(temp_zone, data->graph(),
++                               &data->info()->tick_counter(), data->broker(),
++                               data->jsgraph()->Dead(),
++                               data->observe_node_manager());
++    CommonOperatorReducer common_reducer(
++        &graph_reducer, data->graph(), data->broker(), data->common(),
++        data->machine(), temp_zone, BranchSemantics::kJS);
++    // Fold only redundant value Phis (including Phi(value, self)). The full
++    // common reduction and all call/inlining reductions remain in Inlining.
++    class TrivialPhiReducer final : public Reducer {
++     public:
++      explicit TrivialPhiReducer(CommonOperatorReducer* common)
++          : common_(common) {}
++      const char* reducer_name() const override { return "EarlyOsrTrivialPhi"; }
++      Reduction Reduce(Node* node) final {
++        if (node->opcode() != IrOpcode::kPhi) return NoChange();
++        Node* value = NodeProperties::GetValueInput(node, 0);
++        if (value == node) return NoChange();
++        for (int i = 1; i < node->op()->ValueInputCount(); ++i) {
++          Node* input = NodeProperties::GetValueInput(node, i);
++          if (input != value && input != node) return NoChange();
++        }
++        return common_->Reduce(node);
++      }
++
++     private:
++      CommonOperatorReducer* const common_;
++    } trivial_phi_reducer(&common_reducer);
++    AddReducer(data, &graph_reducer, &trivial_phi_reducer);
++    graph_reducer.ReduceGraph();
++
++    GraphTrimmer trimmer(temp_zone, data->graph());
++    NodeVector roots(temp_zone);
++    data->jsgraph()->GetCachedNodes(&roots);
++    {
++      UnparkedScopeIfNeeded scope(data->broker(),
++                                  v8_flags.trace_turbo_trimming);
++      trimmer.TrimGraph(roots.begin(), roots.end());
++    }
++
++    // Inlining may introduce unmarked terminal exits. Peel before that only
++    // when the entire OSR graph has one small, unnested, single-backedge loop.
++    LoopTree* loop_tree = LoopFinder::BuildLoopTree(
++        data->graph(), &data->info()->tick_counter(), temp_zone);
++    if (loop_tree->outer_loops().size() != 1) return;
++    LoopTree::Loop* loop = loop_tree->outer_loops().front();
++    if (!loop->children().empty() ||
++        loop->TotalSize() > LoopPeeler::kMaxPeeledNodes ||
++        loop_tree->GetLoopControl(loop)->op()->ControlInputCount() != 2) {
++      return;
++    }
++    LoopPeeler peeler(data->graph(), data->common(), loop_tree, temp_zone,
++                      data->source_positions(), data->node_origins());
++    if (!peeler.CanPeel(loop)) return;
++    // Preserve the residual header and leave other markers for the existing
++    // late phase. PeelInnerLoopsOfTree would eliminate markers across the graph.
++    peeler.Peel(loop);
++  }
++};
++
+ struct InliningPhase {
+   DECL_PIPELINE_PHASE_CONSTANTS(Inlining)
+ 
+@@ -1883,6 +1947,11 @@ bool PipelineImpl::CreateGraph(Linkage* linkage) {
+   RUN_MAYBE_ABORT(GraphBuilderPhase, linkage);
+   RunPrintAndVerify(GraphBuilderPhase::phase_name(), true);
+ 
++  if (data->info()->is_osr() && data->info()->loop_peeling()) {
++    RUN_MAYBE_ABORT(EarlyOsrLoopPeelingPhase);
++    RunPrintAndVerify(EarlyOsrLoopPeelingPhase::phase_name(), true);
++  }
++
+   // Perform function context specialization and inlining (if enabled).
+   RUN_MAYBE_ABORT(InliningPhase);
+   RunPrintAndVerify(InliningPhase::phase_name(), true);
 diff --git a/src/compiler/turboshaft/turbolev-graph-builder.cc b/src/compiler/turboshaft/turbolev-graph-builder.cc
 index 7e33f630..7900a476 100644
 --- a/src/compiler/turboshaft/turbolev-graph-builder.cc
@@ -92,6 +179,18 @@ index 7e33f630..7900a476 100644
    maglev::ProcessResult Process(maglev::CallKnownApiFunction* node,
                                  const maglev::ProcessingState& state) {
      GET_FRAME_STATE_MAYBE_ABORT(frame_state, node->lazy_deopt_info());
+diff --git a/src/logging/runtime-call-stats.h b/src/logging/runtime-call-stats.h
+index 9197dd27..b3bb9083 100644
+--- a/src/logging/runtime-call-stats.h
++++ b/src/logging/runtime-call-stats.h
+@@ -247,6 +247,7 @@ namespace v8::internal {
+   ADD_THREAD_SPECIFIC_COUNTER(V, Optimize, CommitAssignment)                  \
+   ADD_THREAD_SPECIFIC_COUNTER(V, Optimize, ConnectRanges)                     \
+   ADD_THREAD_SPECIFIC_COUNTER(V, Optimize, DecideSpillingMode)                \
++  ADD_THREAD_SPECIFIC_COUNTER(V, Optimize, EarlyOsrLoopPeeling)               \
+   ADD_THREAD_SPECIFIC_COUNTER(V, Optimize, EarlyGraphTrimming)                \
+   ADD_THREAD_SPECIFIC_COUNTER(V, Optimize, EarlyOptimization)                 \
+   ADD_THREAD_SPECIFIC_COUNTER(V, Optimize, EscapeAnalysis)                    \
 diff --git a/src/maglev/maglev-graph-builder.cc b/src/maglev/maglev-graph-builder.cc
 index 88ede661..6831d2a2 100644
 --- a/src/maglev/maglev-graph-builder.cc
@@ -321,7 +420,7 @@ index cca74ccc..44fc024b 100644
    return MaglevAssembler::ArgumentStackSlotsForCFunctionCall(1);
  }
 diff --git a/test/cctest/test-api.cc b/test/cctest/test-api.cc
-index 17711879..c6e0470f 100644
+index 17711879..2a6cd331 100644
 --- a/test/cctest/test-api.cc
 +++ b/test/cctest/test-api.cc
 @@ -28,8 +28,10 @@
@@ -343,7 +442,7 @@ index 17711879..c6e0470f 100644
  #include "src/objects/feedback-vector-inl.h"
  #include "src/objects/feedback-vector.h"
  #include "src/objects/hash-table-inl.h"
-@@ -29924,6 +29927,598 @@ TEST(FastApiCallsWithoutReceiver) {
+@@ -29924,6 +29927,787 @@ TEST(FastApiCallsWithoutReceiver) {
  #endif
  }
  
@@ -933,6 +1032,195 @@ index 17711879..c6e0470f 100644
 +    CHECK_GT(bounded_noop_fast.load(), 0);
 +    isolate->CancelTerminateExecution();
 +  }
++  ExpectFalse("boundedCaught || boundedAfter");
++  CHECK(CompileRun("boundedNoop()")->IsUndefined());
++  ExpectInt32("strictIdentity(31)", 31);
++#endif
++}
++
++TEST(FastApiBoundedNativeEarlyOsrPeeling) {
++#if defined(V8_ENABLE_MAGLEV) && defined(V8_ENABLE_TURBOFAN) &&             \
++    !defined(V8_LITE_MODE) && defined(V8_TARGET_ARCH_X64) && V8_OS_LINUX && \
++    !defined(USE_SIMULATOR)
++  if (i::v8_flags.jitless || i::v8_flags.disable_optimizing_compilers) return;
++  BoundedNativeMaglevTest flags(true);
++  i::FlagScope<bool> peeling(&i::v8_flags.turbo_loop_peeling, true);
++  i::FlagScope<bool> inlining(&i::v8_flags.turbo_inlining, true);
++  i::FlagScope<bool> osr(&i::v8_flags.use_osr, true);
++  i::FlagScope<bool> concurrent_osr(&i::v8_flags.concurrent_osr, false);
++  v8::HandleScope scope(CcTest::isolate());
++  LocalContext env;
++  flags.Install(env.local(), true);
++  CompileRun(R"JS(
++    %PrepareFunctionForOptimization(strictIdentity);
++    strictIdentity(1); strictIdentity(2);
++    var osrThrowTier = [false], osrOverflowTier = [false];
++    var osrDeoptTier = [false, false];
++    function osrStrict(count, throwAt) {
++      let total = 0;
++      for (let i = 0; i < count; ++i) {
++        if (i === 0) %OptimizeOsr();
++        osrThrowTier[0] = %CurrentFrameIsTurbofan();
++        total += strictIdentity(i === throwAt ? -0 : 31);
++      }
++      return [total, %CurrentFrameIsTurbofan()];
++    }
++    function osrOverflow(count, requestOsr) {
++      let total = 2147483646;
++      for (let i = 0; i < count; ++i) {
++        if (requestOsr && i === 0) %OptimizeOsr();
++        osrOverflowTier[0] = osrOverflowTier[0] || %CurrentFrameIsTurbofan();
++        total += strictIdentity(1);
++      }
++      return total;
++    }
++    function afterLeaf(count, requestOsr) {
++      let total = 0;
++      for (let i = 0; i < count; ++i) {
++        if (requestOsr && i === 0) %OptimizeOsr();
++        const retained = { value: i };
++        const result = strictIdentity(31);
++        if (i === 1) {
++          osrDeoptTier[0] = %CurrentFrameIsTurbofan();
++          unmarkedSlowIdentity(result);
++          osrDeoptTier[1] = %CurrentFrameIsTurbofan();
++        }
++        total += result + retained.value;
++      }
++      return total;
++    }
++    function osrNested(count) {
++      let total = 0;
++      for (let i = 0; i < count; ++i) {
++        for (let j = 0; j < 2; ++j) {
++          if (i === 0 && j === 0) %OptimizeOsr();
++          total += strictIdentity(31);
++        }
++      }
++      return [total, %CurrentFrameIsTurbofan()];
++    }
++    for (const fn of [osrStrict, osrOverflow, afterLeaf, osrNested]) {
++      %PrepareFunctionForOptimization(fn);
++    }
++    // Prime the return literal and ordinary callback without installing a
++    // normal-entry optimized caller. Subsequent tier checks inspect OSR frames.
++    osrStrict(0, -1);
++    osrOverflow(1, false);
++    afterLeaf(4, false);
++    osrNested(0);
++  )JS");
++  bounded_i32_fast = bounded_i32_slow = 0;
++  ExpectTrue("osrStrict(0, -1)[0] === 0");
++  CHECK_EQ(0, bounded_i32_fast + bounded_i32_slow);
++  // One call before the OSR backedge leaves zero remaining iterations;
++  // two calls leave one peeled iteration; ten also exercise the residual loop.
++  for (int count : {1, 2, 10}) {
++    bounded_i32_fast = bounded_i32_slow = 0;
++    std::string source =
++        "var osrResult = osrStrict(" + std::to_string(count) + ", -1);";
++    CompileRun(source.c_str());
++    ExpectTrue("osrResult[1]");
++    CHECK_EQ(31 * count,
++             CompileRun("osrResult[0]")->Int32Value(env.local()).FromJust());
++    CHECK_EQ(count, bounded_i32_fast + bounded_i32_slow);
++    if (count > 1) CHECK_GT(bounded_i32_fast, 0);
++  }
++
++  // Rejection before OSR, on its first iteration, and later must not enter
++  // the leaf with an invalid input, change its virtual origin, or replay a
++  // call.
++  for (int throw_at : {0, 1, 3}) {
++    bounded_i32_fast = bounded_i32_slow = 0;
++    CompileRun("osrThrowTier[0] = false;");
++    std::string source =
++        "(() => { try { osrStrict(8, " + std::to_string(throw_at) +
++        "); } catch (e) { return e instanceof TypeError && e.message === 'i32'"
++        " && e.stack.includes('lo-bun:binding/bounded.identity'); }"
++        " return false; })()";
++    CHECK(CompileRun(source.c_str())->IsTrue());
++    CHECK_EQ(throw_at + 1, bounded_i32_fast + bounded_i32_slow);
++    if (throw_at == 0) {
++      ExpectFalse("osrThrowTier[0]");
++      CHECK_EQ(0, bounded_i32_fast);
++    } else {
++      ExpectTrue("osrThrowTier[0]");
++    }
++  }
++
++  bounded_i32_fast = bounded_i32_slow = 0;
++  ExpectTrue("osrOverflow(3, true) === 2147483649 && osrOverflowTier[0]");
++  CHECK_EQ(3, bounded_i32_fast + bounded_i32_slow);
++  CHECK_GT(bounded_i32_fast, 0);
++
++  // This callback may GC and lazily deoptimize after the marked call returned.
++  // Its primed call site must preserve the returned value and retained object,
++  // resume after the callback, and execute every marked invocation exactly
++  // once.
++  bounded_i32_fast = bounded_i32_slow = 0;
++  unmarked_i32_fast = unmarked_i32_slow = 0;
++  unmarked_gc = unmarked_deopt = true;
++  i::heap::InvokeMajorGC(CcTest::heap());
++  ExpectInt32("afterLeaf(10, true)", 355);
++  CHECK_EQ(10, bounded_i32_fast + bounded_i32_slow);
++  CHECK_GT(bounded_i32_fast, 0);
++  CHECK_EQ(1, unmarked_i32_slow);
++  CHECK_EQ(0, unmarked_i32_fast);
++  ExpectTrue("osrDeoptTier[0] && !osrDeoptTier[1]");
++  unmarked_gc = unmarked_deopt = false;
++
++  // Nested loops remain eligible only for the existing late pipeline.
++  bounded_i32_fast = bounded_i32_slow = 0;
++  CompileRun("var nestedResult = osrNested(4);");
++  ExpectTrue("nestedResult[0] === 248 && nestedResult[1]");
++  CHECK_EQ(8, bounded_i32_fast + bounded_i32_slow);
++  CHECK_GT(bounded_i32_fast, 0);
++#endif
++}
++
++TEST(FastApiBoundedNativeEarlyOsrPeelingTermination) {
++#if defined(V8_ENABLE_MAGLEV) && defined(V8_ENABLE_TURBOFAN) &&             \
++    !defined(V8_LITE_MODE) && defined(V8_TARGET_ARCH_X64) && V8_OS_LINUX && \
++    !defined(USE_SIMULATOR)
++  if (i::v8_flags.jitless || i::v8_flags.disable_optimizing_compilers) return;
++  BoundedNativeMaglevTest flags(true);
++  i::FlagScope<bool> peeling(&i::v8_flags.turbo_loop_peeling, true);
++  i::FlagScope<bool> inlining(&i::v8_flags.turbo_inlining, true);
++  i::FlagScope<bool> osr(&i::v8_flags.use_osr, true);
++  i::FlagScope<bool> concurrent_osr(&i::v8_flags.concurrent_osr, false);
++  v8::Isolate* isolate = CcTest::isolate();
++  v8::HandleScope scope(isolate);
++  LocalContext env;
++  flags.Install(env.local(), true);
++  CompileRun(R"JS(
++    var boundedCaught = false, boundedAfter = false, osrTerminationTier = [false];
++    function osrTerminatingLoop(count) {
++      try {
++        for (let i = 0; i < count; ++i) {
++          if (i === 0) %OptimizeOsr();
++          osrTerminationTier[0] = %CurrentFrameIsTurbofan();
++          boundedNoop();
++        }
++      } catch (e) { boundedCaught = true; }
++      boundedAfter = true;
++    }
++    %PrepareFunctionForOptimization(osrTerminatingLoop);
++    osrTerminatingLoop(32);
++  )JS");
++  ExpectTrue("osrTerminationTier[0]");
++  CHECK_GT(bounded_noop_fast.load(), 0);
++  CompileRun("boundedCaught = boundedAfter = osrTerminationTier[0] = false;");
++  bounded_noop_fast = bounded_noop_slow = 0;
++  TerminateExecutionThread terminator(isolate);
++  {
++    v8::TryCatch try_catch(isolate);
++    CHECK(terminator.Start());
++    CHECK(CompileRun("osrTerminatingLoop(2147483647)").IsEmpty());
++    terminator.Join();
++    CHECK(try_catch.HasTerminated());
++    CHECK_GT(bounded_noop_fast.load(), 0);
++    isolate->CancelTerminateExecution();
++  }
++  ExpectTrue("osrTerminationTier[0]");
 +  ExpectFalse("boundedCaught || boundedAfter");
 +  CHECK(CompileRun("boundedNoop()")->IsUndefined());
 +  ExpectInt32("strictIdentity(31)", 31);
