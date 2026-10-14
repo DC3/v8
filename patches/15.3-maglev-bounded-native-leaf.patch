@@ -73,93 +73,6 @@ index 61da1c48..6feff367 100644
        arg_count_(arg_count),
        arg_info_(arg_info) {
    DCHECK(repr == Int64Representation::kNumber ||
-diff --git a/src/compiler/pipeline.cc b/src/compiler/pipeline.cc
-index 8605bf97..d7f5b2f7 100644
---- a/src/compiler/pipeline.cc
-+++ b/src/compiler/pipeline.cc
-@@ -916,6 +916,70 @@ struct GraphBuilderPhase {
-   }
- };
- 
-+struct EarlyOsrLoopPeelingPhase {
-+  DECL_PIPELINE_PHASE_CONSTANTS(EarlyOsrLoopPeeling)
-+
-+  void Run(TFPipelineData* data, Zone* temp_zone) {
-+    GraphReducer graph_reducer(temp_zone, data->graph(),
-+                               &data->info()->tick_counter(), data->broker(),
-+                               data->jsgraph()->Dead(),
-+                               data->observe_node_manager());
-+    CommonOperatorReducer common_reducer(
-+        &graph_reducer, data->graph(), data->broker(), data->common(),
-+        data->machine(), temp_zone, BranchSemantics::kJS);
-+    // Fold only redundant value Phis (including Phi(value, self)). The full
-+    // common reduction and all call/inlining reductions remain in Inlining.
-+    class TrivialPhiReducer final : public Reducer {
-+     public:
-+      explicit TrivialPhiReducer(CommonOperatorReducer* common)
-+          : common_(common) {}
-+      const char* reducer_name() const override { return "EarlyOsrTrivialPhi"; }
-+      Reduction Reduce(Node* node) final {
-+        if (node->opcode() != IrOpcode::kPhi) return NoChange();
-+        Node* value = NodeProperties::GetValueInput(node, 0);
-+        if (value == node) return NoChange();
-+        for (int i = 1; i < node->op()->ValueInputCount(); ++i) {
-+          Node* input = NodeProperties::GetValueInput(node, i);
-+          if (input != value && input != node) return NoChange();
-+        }
-+        return common_->Reduce(node);
-+      }
-+
-+     private:
-+      CommonOperatorReducer* const common_;
-+    } trivial_phi_reducer(&common_reducer);
-+    AddReducer(data, &graph_reducer, &trivial_phi_reducer);
-+    graph_reducer.ReduceGraph();
-+
-+    GraphTrimmer trimmer(temp_zone, data->graph());
-+    NodeVector roots(temp_zone);
-+    data->jsgraph()->GetCachedNodes(&roots);
-+    {
-+      UnparkedScopeIfNeeded scope(data->broker(),
-+                                  v8_flags.trace_turbo_trimming);
-+      trimmer.TrimGraph(roots.begin(), roots.end());
-+    }
-+
-+    // Inlining may introduce unmarked terminal exits. Peel before that only
-+    // when the entire OSR graph has one small, unnested, single-backedge loop.
-+    LoopTree* loop_tree = LoopFinder::BuildLoopTree(
-+        data->graph(), &data->info()->tick_counter(), temp_zone);
-+    if (loop_tree->outer_loops().size() != 1) return;
-+    LoopTree::Loop* loop = loop_tree->outer_loops().front();
-+    if (!loop->children().empty() ||
-+        loop->TotalSize() > LoopPeeler::kMaxPeeledNodes ||
-+        loop_tree->GetLoopControl(loop)->op()->ControlInputCount() != 2) {
-+      return;
-+    }
-+    LoopPeeler peeler(data->graph(), data->common(), loop_tree, temp_zone,
-+                      data->source_positions(), data->node_origins());
-+    if (!peeler.CanPeel(loop)) return;
-+    // Preserve the residual header and leave other markers for the existing
-+    // late phase. PeelInnerLoopsOfTree would eliminate markers across the graph.
-+    peeler.Peel(loop);
-+  }
-+};
-+
- struct InliningPhase {
-   DECL_PIPELINE_PHASE_CONSTANTS(Inlining)
- 
-@@ -1883,6 +1947,11 @@ bool PipelineImpl::CreateGraph(Linkage* linkage) {
-   RUN_MAYBE_ABORT(GraphBuilderPhase, linkage);
-   RunPrintAndVerify(GraphBuilderPhase::phase_name(), true);
- 
-+  if (data->info()->is_osr() && data->info()->loop_peeling()) {
-+    RUN_MAYBE_ABORT(EarlyOsrLoopPeelingPhase);
-+    RunPrintAndVerify(EarlyOsrLoopPeelingPhase::phase_name(), true);
-+  }
-+
-   // Perform function context specialization and inlining (if enabled).
-   RUN_MAYBE_ABORT(InliningPhase);
-   RunPrintAndVerify(InliningPhase::phase_name(), true);
 diff --git a/src/compiler/turboshaft/turbolev-graph-builder.cc b/src/compiler/turboshaft/turbolev-graph-builder.cc
 index 7e33f630..7900a476 100644
 --- a/src/compiler/turboshaft/turbolev-graph-builder.cc
@@ -179,18 +92,6 @@ index 7e33f630..7900a476 100644
    maglev::ProcessResult Process(maglev::CallKnownApiFunction* node,
                                  const maglev::ProcessingState& state) {
      GET_FRAME_STATE_MAYBE_ABORT(frame_state, node->lazy_deopt_info());
-diff --git a/src/logging/runtime-call-stats.h b/src/logging/runtime-call-stats.h
-index 9197dd27..b3bb9083 100644
---- a/src/logging/runtime-call-stats.h
-+++ b/src/logging/runtime-call-stats.h
-@@ -247,6 +247,7 @@ namespace v8::internal {
-   ADD_THREAD_SPECIFIC_COUNTER(V, Optimize, CommitAssignment)                  \
-   ADD_THREAD_SPECIFIC_COUNTER(V, Optimize, ConnectRanges)                     \
-   ADD_THREAD_SPECIFIC_COUNTER(V, Optimize, DecideSpillingMode)                \
-+  ADD_THREAD_SPECIFIC_COUNTER(V, Optimize, EarlyOsrLoopPeeling)               \
-   ADD_THREAD_SPECIFIC_COUNTER(V, Optimize, EarlyGraphTrimming)                \
-   ADD_THREAD_SPECIFIC_COUNTER(V, Optimize, EarlyOptimization)                 \
-   ADD_THREAD_SPECIFIC_COUNTER(V, Optimize, EscapeAnalysis)                    \
 diff --git a/src/maglev/maglev-graph-builder.cc b/src/maglev/maglev-graph-builder.cc
 index 88ede661..6831d2a2 100644
 --- a/src/maglev/maglev-graph-builder.cc
@@ -420,7 +321,7 @@ index cca74ccc..44fc024b 100644
    return MaglevAssembler::ArgumentStackSlotsForCFunctionCall(1);
  }
 diff --git a/test/cctest/test-api.cc b/test/cctest/test-api.cc
-index 17711879..9247b43c 100644
+index 17711879..09b20ab3 100644
 --- a/test/cctest/test-api.cc
 +++ b/test/cctest/test-api.cc
 @@ -28,8 +28,10 @@
@@ -450,7 +351,7 @@ index 17711879..9247b43c 100644
  #include "src/objects/feedback-vector-inl.h"
  #include "src/objects/feedback-vector.h"
  #include "src/objects/hash-table-inl.h"
-@@ -29924,6 +29928,797 @@ TEST(FastApiCallsWithoutReceiver) {
+@@ -29924,6 +29928,798 @@ TEST(FastApiCallsWithoutReceiver) {
  #endif
  }
  
@@ -1131,7 +1032,8 @@ index 17711879..9247b43c 100644
 +  ExpectTrue("osrStrict(0, -1)[0] === 0");
 +  CHECK_EQ(0, bounded_i32_fast + bounded_i32_slow);
 +  // One call before the OSR backedge leaves zero remaining iterations;
-+  // two calls leave one peeled iteration; ten also exercise the residual loop.
++  // two calls leave one remaining OSR iteration; ten also exercise the
++  // residual loop.
 +  for (int count : {1, 2, 10}) {
 +    bounded_i32_fast = bounded_i32_slow = 0;
 +    std::string source =
