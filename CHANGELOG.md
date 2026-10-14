@@ -1,5 +1,10 @@
 # 变更记录
 
+## [2026-10-14] 保留更新补丁时未变源码的 Ninja 缓存
+
+- 760仅测试变化仍重编1590目标，定位完整reverse/apply重写未变头文件mtime。仅cached/recorded/patch变化时，在本轮输出里临时快照旧diff源文件；完整sync/apply及原校验后，仅byte-identical恢复原纳秒mtime，再精确清理快照。
+- 真实变化保持新mtime，源码闭包/GN/依赖/完整build与34 native门禁不跳过；不改当前760/cache或新增持久副本。静态和有界临时fixture检查通过，实际减少重编仍待后续CI，不宣运行时性能收益。
+
 ## [2026-10-14] 修正 OSR 回归测试的实际退优化触发
 
 - Forgejo109编译及原32项native通过，新增OSR用例在GC后tier断言失败；现场和单回trace确认普通入口intrinsic未失效OSR-only代码，未产包或消费。

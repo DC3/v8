@@ -108,6 +108,50 @@ for name, path in checkouts:
         raise SystemExit('untracked dependency source: ' + name)
 PY
 }
+# Patch replacement rewrites the old diff; retain timestamps only for source
+# whose final bytes are unchanged. The snapshot belongs to this invocation.
+patch_source_mtimes() {
+  python3 - "$1" "$task_source" "$task_work/patch-source-before" <<'PY'
+import os, pathlib, shutil, subprocess, sys
+action, root, snapshot = sys.argv[1], pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
+if action == 'snapshot':
+    snapshot.mkdir()
+    paths = subprocess.check_output([
+        'git', '-C', str(root), 'diff', '--no-ext-diff', '--no-textconv',
+        '--name-only', '-z']).split(b'\0')
+    for name in filter(None, paths):
+        relative = pathlib.Path(os.fsdecode(name))
+        source = root / relative
+        if source.is_symlink() or not source.resolve().is_relative_to(root.resolve()):
+            raise SystemExit('invalid patched source: ' + str(relative))
+        if not source.exists():
+            continue
+        if not source.is_file():
+            raise SystemExit('nonregular patched source: ' + str(relative))
+        saved = snapshot / relative
+        saved.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, saved)
+elif action == 'restore':
+    for saved in snapshot.rglob('*'):
+        if saved.is_symlink():
+            raise SystemExit('invalid source snapshot')
+        if not saved.is_file():
+            continue
+        source = root / saved.relative_to(snapshot)
+        if source.is_symlink() or not source.resolve().is_relative_to(root.resolve()):
+            raise SystemExit('invalid patched source: ' + str(source))
+        if not source.exists():
+            continue
+        if not source.is_file():
+            raise SystemExit('nonregular patched source: ' + str(source))
+        if saved.read_bytes() == source.read_bytes():
+            os.utime(source, ns=(source.stat().st_atime_ns, saved.stat().st_mtime_ns),
+                     follow_symlinks=False)
+    shutil.rmtree(snapshot)
+else:
+    raise SystemExit('invalid source timestamp operation')
+PY
+}
 check_cpp_patch() {
   local task_added task_removed task_path
   git apply --numstat "$1" | while IFS=$'\t' read -r task_added task_removed task_path; do
@@ -195,6 +239,7 @@ export DEPOT_TOOLS_METRICS=0
 if [[ ! -e "$task_build/.gclient" ]]; then gclient_config > "$task_build/.gclient"; fi
 if [[ -f "$task_source/DEPS" ]]; then check_dependencies allow-missing; fi
 if $task_recorded && ! $task_same_patches; then
+  if $task_cached; then patch_source_mtimes snapshot; fi
   git -C "$task_source" apply --reverse --check "$task_state"
   git -C "$task_source" apply --reverse "$task_state"
   git -C "$task_source" diff --quiet
@@ -223,6 +268,10 @@ else
     git -C "$task_source" apply "$task_repo/patches/$task_patch"
   done
   if $task_cached; then
+    if $task_recorded; then
+      git -C "$task_source" diff --check
+      patch_source_mtimes restore
+    fi
     mkdir -p "$task_patch_state"
     for task_patch in "${task_patches[@]}"; do
       cp "$task_repo/patches/$task_patch" "$task_patch_state/$task_patch"
