@@ -314,6 +314,10 @@ for task_case in \
   run_cctest "test-api/$task_case"
 done
 test "$task_native_count" -eq 30
+for task_case in FastApiBoundedNativeTurboFan FastApiBoundedNativeTurboFanTermination; do
+  run_cctest "test-api/$task_case"
+done
+test "$task_native_count" -eq 32
 printf 'TOTAL_PASS=%s\n' "$task_native_count" >> "$task_info/native-gates.txt"
 
 # Existing seed paths: the rsp is interpreted from the consumer seed root.

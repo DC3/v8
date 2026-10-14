@@ -1,5 +1,11 @@
 # 变更记录
 
+## [2026-10-14] 实验 bounded leaf 的 TurboFan 返回后检查
+
+- 前一 producer 经 Forgejo107 完整构建与30原生门禁、成套 runtime 消费通过；FFI identity 仍红，同 seed ABBA 未证明稳定收益，不作性能 KEEP。
+- 下一单变量只对实际标记 bounded-no-vm、Linux x64 普通 JS、真实 receiver 和受限 void/i32 签名省 TurboFan 成功调用后的异常检查；默认 callee、Wasm、转换、fallback、effects、VM frame 与终止 poll 保持。安全设计已独审，代码与真实收益尚待验收。
+- 原30 native 逐项保留，新增永久 TurboFan correctness/终止回归，完整32项通过后才产包；复用已有缓存和消费入口，不新增验证设施。
+
 ## [2026-10-14] 准备真实内联 deopt 回归的 callee feedback
 
 - Forgejo106完整构建与原27项native、新增基础Maglev通过，deopt回归的真实内联断言失败；既有inlining trace确认identity尚无反馈，新增显式准备与两次callee预热。

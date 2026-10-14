@@ -73,6 +73,120 @@ index 61da1c48..6feff367 100644
        arg_count_(arg_count),
        arg_info_(arg_info) {
    DCHECK(repr == Int64Representation::kNumber ||
+diff --git a/src/compiler/turboshaft/fast-api-call-lowering-reducer.h b/src/compiler/turboshaft/fast-api-call-lowering-reducer.h
+index 0e270250..28f6bc63 100644
+--- a/src/compiler/turboshaft/fast-api-call-lowering-reducer.h
++++ b/src/compiler/turboshaft/fast-api-call-lowering-reducer.h
+@@ -109,37 +109,41 @@ class FastApiCallLoweringReducer : public Next {
+ 
+       Label<> trigger_exception(this);
+ 
+-      V<Object> exception =
+-          __ Load(__ IsolateField(IsolateFieldId::kException),
+-                  LoadOp::Kind::RawAligned(), MemoryRepresentation::UintPtr());
+-      GOTO_IF_NOT(
+-          LIKELY(__ TaggedEqual(
+-              exception, __ template LoadRoot<RootIndex::kTheHoleValue>())),
+-          trigger_exception);
++      if (!CanSkipExceptionCheck(c_function.signature, frame_state)) {
++        V<Object> exception = __ Load(
++            __ IsolateField(IsolateFieldId::kException),
++            LoadOp::Kind::RawAligned(), MemoryRepresentation::UintPtr());
++        GOTO_IF_NOT(
++            LIKELY(__ TaggedEqual(
++                exception, __ template LoadRoot<RootIndex::kTheHoleValue>())),
++            trigger_exception);
++      }
+ 
+       V<Any> fast_call_result = ConvertReturnValue(c_signature, c_call_result);
+       __ SetVariable(result, fast_call_result);
+ 
+       GOTO(done, FastApiCallOp::kSuccessValue);
+-      BIND(trigger_exception);
+-      if (frame_state.valid()) {
+-        __ template CallRuntime<typename runtime::PropagateException>(
+-            frame_state, context, {}, LazyDeoptOnThrow{false});
+-      } else {
++      if (BIND(trigger_exception)) {
++        if (frame_state.valid()) {
++          __ template CallRuntime<typename runtime::PropagateException>(
++              frame_state, context, {}, LazyDeoptOnThrow{false});
++        } else {
+ #if V8_ENABLE_WEBASSEMBLY
+-        using Desc = deprecated::BuiltinCallDescriptor::WasmPropagateException;
+-        OpIndex propagate_exception_builtin =
+-            __ SmiConstant(Smi::FromInt(static_cast<int>(Desc::kFunction)));
+-        __ Call(
+-            propagate_exception_builtin, OpIndex::Invalid(), {},
+-            Desc::Create(StubCallMode::kCallBuiltinPointer, __ graph_zone()),
+-            Desc::kEffects);
++          using Desc =
++              deprecated::BuiltinCallDescriptor::WasmPropagateException;
++          OpIndex propagate_exception_builtin =
++              __ SmiConstant(Smi::FromInt(static_cast<int>(Desc::kFunction)));
++          __ Call(
++              propagate_exception_builtin, OpIndex::Invalid(), {},
++              Desc::Create(StubCallMode::kCallBuiltinPointer, __ graph_zone()),
++              Desc::kEffects);
+ #else
+-        UNREACHABLE();
++          UNREACHABLE();
+ #endif  // V8_ENABLE_WEBASSEMBLY
+-      }
++        }
+ 
+-      __ Unreachable();
++        __ Unreachable();
++      }
+     }
+ 
+     if (BIND(handle_error)) {
+@@ -154,6 +158,45 @@ class FastApiCallLoweringReducer : public Next {
+   }
+ 
+  private:
++  bool CanSkipExceptionCheck(const CFunctionInfo* signature,
++                             V<LazyFrameState> frame_state) {
++#if V8_OS_LINUX && defined(V8_TARGET_ARCH_X64) && !defined(USE_SIMULATOR)
++    // A bounded leaf cannot enter V8, poll an interrupt, unlock the isolate,
++    // or throw. The ordinary JS entry has no pending exception, and another
++    // thread requesting termination only schedules an interrupt. Keep all call
++    // effects and frame publication; this removes only the post-call check.
++    // Wasm wrappers have a separate exception contract and remain unchanged.
++    if (__ data()->pipeline_kind() != TurboshaftPipelineKind::kJS ||
++        !frame_state.valid() ||
++        signature->GetNativeCallContract() !=
++            CFunctionInfo::NativeCallContract::kBoundedNoVM ||
++        !signature->HasReceiverArg() || signature->HasOptions() ||
++        signature->GetInt64Representation() !=
++            CFunctionInfo::Int64Representation::kNumber ||
++        signature->ReturnInfo().GetFlags() != CTypeInfo::Flags::kNone) {
++      return false;
++    }
++    const unsigned int count = signature->ArgumentCount();
++    if (count == 0 ||
++        signature->ArgumentInfo(0).GetType() != CTypeInfo::Type::kV8Value) {
++      return false;
++    }
++    for (unsigned int index = 0; index < count; ++index) {
++      if (signature->ArgumentInfo(index).GetFlags() !=
++          CTypeInfo::Flags::kNone) {
++        return false;
++      }
++    }
++    return (count == 1 &&
++            signature->ReturnInfo().GetType() == CTypeInfo::Type::kVoid) ||
++           (count == 2 &&
++            signature->ReturnInfo().GetType() == CTypeInfo::Type::kInt32 &&
++            signature->ArgumentInfo(1).GetType() == CTypeInfo::Type::kInt32);
++#else
++    return false;
++#endif
++  }
++
+   template <typename T>
+   V<T> Checked(V<Tuple<T, Word32>> result, Label<>& otherwise) {
+     V<Word32> result_state = __ template Projection<1>(result);
 diff --git a/src/compiler/turboshaft/turbolev-graph-builder.cc b/src/compiler/turboshaft/turbolev-graph-builder.cc
 index 7e33f630..7900a476 100644
 --- a/src/compiler/turboshaft/turbolev-graph-builder.cc
@@ -321,7 +435,7 @@ index cca74ccc..44fc024b 100644
    return MaglevAssembler::ArgumentStackSlotsForCFunctionCall(1);
  }
 diff --git a/test/cctest/test-api.cc b/test/cctest/test-api.cc
-index 17711879..5d3ca260 100644
+index 17711879..c6e0470f 100644
 --- a/test/cctest/test-api.cc
 +++ b/test/cctest/test-api.cc
 @@ -28,8 +28,10 @@
@@ -343,7 +457,7 @@ index 17711879..5d3ca260 100644
  #include "src/objects/feedback-vector-inl.h"
  #include "src/objects/feedback-vector.h"
  #include "src/objects/hash-table-inl.h"
-@@ -29924,6 +29927,423 @@ TEST(FastApiCallsWithoutReceiver) {
+@@ -29924,6 +29927,598 @@ TEST(FastApiCallsWithoutReceiver) {
  #endif
  }
  
@@ -360,9 +474,11 @@ index 17711879..5d3ca260 100644
 +int bounded_i32_slow = 0;
 +int unmarked_i32_fast = 0;
 +int unmarked_i32_slow = 0;
++int default_throwing_i32_fast = 0;
 +uintptr_t bounded_receiver = 0;
 +bool unmarked_gc = false;
 +bool unmarked_deopt = false;
++bool default_i32_throw = false;
 +
 +void RecordBoundedReceiver(v8::Local<v8::Value> receiver) {
 +  static_assert(sizeof(receiver) == sizeof(uintptr_t));
@@ -440,12 +556,24 @@ index 17711879..5d3ca260 100644
 +  info.GetReturnValue().Set(info[0]);
 +}
 +
++// The same scalar signature with the default contract may publish an exception
++// from the fast callback. Its exception propagation must not be elided.
++int32_t DefaultThrowingIdentity(v8::Local<v8::Value> receiver, int32_t value) {
++  ++default_throwing_i32_fast;
++  if (default_i32_throw) {
++    v8::Isolate* isolate = CcTest::isolate();
++    v8::HandleScope scope(isolate);
++    isolate->ThrowException(v8_str("default fast exception"));
++  }
++  return value;
++}
++
 +class BoundedNativeMaglevTest {
 + public:
-+  BoundedNativeMaglevTest()
++  explicit BoundedNativeMaglevTest(bool use_turbofan = false)
 +      : natives_(&i::v8_flags.allow_natives_syntax, true),
-+        maglev_(&i::v8_flags.maglev, true),
-+        turbofan_(&i::v8_flags.turbofan, false),
++        maglev_(&i::v8_flags.maglev, !use_turbofan),
++        turbofan_(&i::v8_flags.turbofan, use_turbofan),
 +        turbolev_(&i::v8_flags.turbolev, false),
 +        concurrent_(&i::v8_flags.concurrent_recompilation, false),
 +        fast_api_(&i::v8_flags.turbo_fast_api_calls, true),
@@ -456,9 +584,11 @@ index 17711879..5d3ca260 100644
 +    bounded_i32_fast = bounded_i32_slow = 0;
 +    unmarked_i32_fast = unmarked_i32_slow = 0;
 +    unmarked_gc = unmarked_deopt = false;
++    default_throwing_i32_fast = 0;
++    default_i32_throw = false;
 +  }
 +
-+  void Install(v8::Local<v8::Context> context) {
++  void Install(v8::Local<v8::Context> context, bool for_turbofan = false) {
 +    v8::Isolate* isolate = CcTest::isolate();
 +    v8::HandleScope scope(isolate);
 +    static const v8::CTypeInfo arguments[] = {
@@ -497,6 +627,17 @@ index 17711879..5d3ca260 100644
 +    install("boundedIdentity", BoundedIdentitySlow, &identity);
 +    install("unmarkedIdentity", UnmarkedIdentitySlow, &unmarked);
 +    install("checkedIdentity", BoundedIdentitySlow, nullptr);
++    if (for_turbofan) {
++      static const v8::CFunction throwing =
++          v8::CFunction::Make(DefaultThrowingIdentity);
++      CHECK_EQ(v8::CFunctionInfo::NativeCallContract::kDefault,
++               throwing.GetTypeInfo()->GetNativeCallContract());
++      install("defaultIdentity", BoundedIdentitySlow, &throwing);
++      // This ordinary callback executes after the bounded leaf has returned,
++      // so it may GC and lazily deoptimize the caller without violating the
++      // bounded contract or asking a non-void fast call to lazily deoptimize.
++      install("unmarkedSlowIdentity", UnmarkedIdentitySlow, nullptr);
++    }
 +
 +    // Match the real getter's CompileFunction closure and free raw(value) call.
 +    v8::ScriptOrigin origin(v8_str("lo-bun:binding/bounded.identity"));
@@ -747,6 +888,154 @@ index 17711879..5d3ca260 100644
 +    boundedCaught = boundedAfter = false;
 +  )JS");
 +  CheckBoundedMaglev("boundedLoop");
++  bounded_noop_fast = 0;
++  TerminateExecutionThread terminator(isolate);
++  {
++    v8::TryCatch try_catch(isolate);
++    CHECK(terminator.Start());
++    CHECK(CompileRun("boundedLoop(2147483647)").IsEmpty());
++    terminator.Join();
++    CHECK(try_catch.HasTerminated());
++    CHECK_GT(bounded_noop_fast.load(), 0);
++    isolate->CancelTerminateExecution();
++  }
++  ExpectFalse("boundedCaught || boundedAfter");
++  CHECK(CompileRun("boundedNoop()")->IsUndefined());
++  ExpectInt32("strictIdentity(31)", 31);
++#endif
++}
++
++TEST(FastApiBoundedNativeTurboFan) {
++#if defined(V8_ENABLE_MAGLEV) && defined(V8_ENABLE_TURBOFAN) &&             \
++    !defined(V8_LITE_MODE) && defined(V8_TARGET_ARCH_X64) && V8_OS_LINUX && \
++    !defined(USE_SIMULATOR)
++  if (i::v8_flags.jitless || i::v8_flags.disable_optimizing_compilers) return;
++  BoundedNativeMaglevTest flags(true);
++  v8::HandleScope scope(CcTest::isolate());
++  LocalContext env;
++  flags.Install(env.local(), true);
++  CompileRun(R"JS(
++    %PrepareFunctionForOptimization(strictIdentity);
++    strictIdentity(1); strictIdentity(2);
++    function tfNoop() { return boundedNoop(); }
++    function tfIdentity(value) { return boundedIdentity(value); }
++    function tfStrict(value) { return strictIdentity(value); }
++    function tfDefaultIdentity(value) { return defaultIdentity(value); }
++    function afterLeaf(value) {
++      const retained = { value: 11 };
++      const result = strictIdentity(value);
++      unmarkedSlowIdentity(value);
++      return result + retained.value;
++    }
++    for (const fn of [tfNoop, tfIdentity, tfStrict, tfDefaultIdentity, afterLeaf]) {
++      %PrepareFunctionForOptimization(fn);
++      fn(1); fn(2);
++      %OptimizeFunctionOnNextCall(fn);
++      fn(3);
++    }
++  )JS");
++  ExpectTrue(R"JS(
++    [tfNoop, tfIdentity, tfStrict, tfDefaultIdentity, afterLeaf]
++      .every(fn => %ActiveTierIsTurbofan(fn))
++  )JS");
++  bounded_noop_fast = bounded_noop_slow = 0;
++  bounded_i32_fast = bounded_i32_slow = 0;
++  CHECK(CompileRun("tfNoop()")->IsUndefined());
++  CHECK_EQ(1, bounded_noop_fast.load());
++  CHECK_EQ(0, bounded_noop_slow);
++  ExpectInt32("tfIdentity(-2147483648)", std::numeric_limits<int32_t>::min());
++  ExpectInt32("tfIdentity(2147483647)", std::numeric_limits<int32_t>::max());
++  ExpectInt32("tfStrict(31)", 31);
++  CHECK_EQ(3, bounded_i32_fast);
++  CHECK_EQ(0, bounded_i32_slow);
++  CHECK_EQ(v8::Utils::OpenDirectHandle(*env->Global())->ptr(),
++           bounded_receiver);
++
++  // Check both the default fast path and its exception path while marked
++  // functions with the identical scalar signature remain in the same context.
++  default_throwing_i32_fast = 0;
++  ExpectInt32("tfDefaultIdentity(31)", 31);
++  CHECK_EQ(1, default_throwing_i32_fast);
++  default_i32_throw = true;
++  ExpectTrue(R"JS(
++    (() => { try { tfDefaultIdentity(31); } catch (e) {
++      return e === 'default fast exception';
++    } return false; })()
++  )JS");
++  CHECK_EQ(2, default_throwing_i32_fast);
++  CHECK_EQ(0, bounded_i32_slow);
++  default_i32_throw = false;
++  CHECK(CompileRun("tfNoop()")->IsUndefined());
++  CHECK_EQ(2, bounded_noop_fast.load());
++
++  // Installation's local HandleScope is gone: data and the strict closure
++  // must remain rooted by their functions, including across a subsequent slow
++  // fallback that checks the callback data.
++  i::heap::InvokeMajorGC(CcTest::heap());
++  ExpectInt32("tfStrict(31)", 31);
++  CHECK_EQ(4, bounded_i32_fast);
++  CHECK_EQ(0, bounded_i32_slow);
++  ExpectTrue("%ActiveTierIsTurbofan(tfIdentity)");
++  bounded_i32_fast = bounded_i32_slow = 0;
++  ExpectTrue(R"JS(
++    (() => { try { tfIdentity('31'); } catch (e) {
++      return e instanceof TypeError;
++    } return false; })()
++  )JS");
++  CHECK_EQ(0, bounded_i32_fast);
++  CHECK_EQ(1, bounded_i32_slow);
++  ExpectTrue("%ActiveTierIsTurbofan(tfStrict)");
++  bounded_i32_fast = bounded_i32_slow = 0;
++  ExpectTrue(R"JS(
++    (() => { try { tfStrict(-0); } catch (e) {
++      return e instanceof TypeError &&
++        e.stack.includes('lo-bun:binding/bounded.identity');
++    } return false; })()
++  )JS");
++  CHECK_EQ(0, bounded_i32_fast);
++  CHECK_EQ(1, bounded_i32_slow);
++
++  // GC and caller lazy deoptimization occur in a later ordinary API callback,
++  // after the marked leaf has returned. Restoring the caller must not replay
++  // the marked call or lose its returned value.
++  ExpectTrue("%ActiveTierIsTurbofan(afterLeaf)");
++  bounded_i32_fast = bounded_i32_slow = 0;
++  unmarked_i32_slow = 0;
++  unmarked_gc = unmarked_deopt = true;
++  ExpectInt32("afterLeaf(31)", 42);
++  CHECK_EQ(1, bounded_i32_fast);
++  CHECK_EQ(0, bounded_i32_slow);
++  CHECK_EQ(1, unmarked_i32_slow);
++  CHECK_EQ(0, unmarked_i32_fast);
++  ExpectFalse("%ActiveTierIsTurbofan(afterLeaf)");
++#endif
++}
++
++TEST(FastApiBoundedNativeTurboFanTermination) {
++#if defined(V8_ENABLE_MAGLEV) && defined(V8_ENABLE_TURBOFAN) &&             \
++    !defined(V8_LITE_MODE) && defined(V8_TARGET_ARCH_X64) && V8_OS_LINUX && \
++    !defined(USE_SIMULATOR)
++  if (i::v8_flags.jitless || i::v8_flags.disable_optimizing_compilers) return;
++  BoundedNativeMaglevTest flags(true);
++  v8::Isolate* isolate = CcTest::isolate();
++  v8::HandleScope scope(isolate);
++  LocalContext env;
++  flags.Install(env.local(), true);
++  CompileRun(R"JS(
++    var boundedCaught = false, boundedAfter = false;
++    function boundedLoop(count) {
++      try {
++        for (let i = 0; i < count; ++i) boundedNoop();
++      } catch (e) { boundedCaught = true; }
++      boundedAfter = true;
++    }
++    %PrepareFunctionForOptimization(boundedLoop);
++    boundedLoop(10); boundedLoop(10);
++    %OptimizeFunctionOnNextCall(boundedLoop);
++    boundedLoop(10);
++    boundedCaught = boundedAfter = false;
++  )JS");
++  ExpectTrue("%ActiveTierIsTurbofan(boundedLoop)");
 +  bounded_noop_fast = 0;
 +  TerminateExecutionThread terminator(isolate);
 +  {
