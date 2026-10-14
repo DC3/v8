@@ -1,5 +1,12 @@
 # 变更记录
 
+## [2026-10-14] 结束 fresh arguments 候选并撤回生产实现
+
+- Forgejo115/API807实际36、百万43M及完整396测试/7956断言通过；实际sample Maglev成功回边完整消除40B arguments和24B backing，未转移到native helper，非作者机械独审通过。
+- 原FFI唯一预声明诊断12样本/checksum完整，identity19791超过15200；formalAcceptance=false且采样前Java负载，不判稳定退化。HTTP诊断绿灯不替代FFI，停止file/ABBA，不補采或保留失败实验代码。
+- patch/script/README逐字恢复06106ed同内容，保原34语义及mtime缓存修正，精确撤回和停止方案已独审。相同内容778有真实34通过，本次不重复派发恢复CI，不冒新producer exact-head绿。
+- 23个失败候选/临时suite目标经精确owner/Git/process/container核查后清理，保护父目录、基线和唯一cache；只保小原件结论，Btrfs独占分配不是宿主净回收。
+
 ## [2026-10-14] 实验消除 fresh arguments 的只读分配
 
 - 依据实际sample每轮40B参数对象和24B内部数组分配，仅在默认关闭object tracking时为普通Maglev中新建未逃逸plain arguments及唯一内部FixedArray启用只读virtual字段和常量length复用；写入、mapped参数、parent逃逸与跨循环旧对象继续原路径。原flag开启路径、FFI合同、effects、FrameState与回边poll保持。
