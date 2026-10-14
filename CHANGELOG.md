@@ -1,5 +1,10 @@
 # 变更记录
 
+## [2026-10-14] 撤回未证收益的 TF 异常后检削减
+
+- 前一候选真实32 native、runtime394测试和原三门禁通过，但预定ABBA的identity表观改善12.7%小于未改pointer的14.8%，控制组自身漂移超过30%；独立复算INCONCLUSIVE，不追加同候选采样。
+- 仅将lowerer生产代码精确恢复成功713原件，不删除默认异常检查；保留与优化无关的两项长期TF正确性/终止恢复回归和完整32项门禁。恢复后的32项真实执行待下次构建，不把旧PASS冒作新head结果。
+
 ## [2026-10-14] 实验 bounded leaf 的 TurboFan 返回后检查
 
 - 前一 producer 经 Forgejo107 完整构建与30原生门禁、成套 runtime 消费通过；FFI identity 仍红，同 seed ABBA 未证明稳定收益，不作性能 KEEP。

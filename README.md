@@ -57,4 +57,4 @@ Rust rsp 内的 `v8/rust-rlibs/...` 从消费者 seed 根目录解释。headers�
 
 ## 验证边界
 
-前一 bounded Maglev producer 已通过 Forgejo107 完整构建和30 native；当前新增 TurboFan 实验仍待独立代码审查与真实32项 native。成套 artifact 以对应成功 CI 为准；消费者还须完成真实 runtime、完整 correctness 和原性能门禁，才能判断效果。其他平台、Debug、sandbox、pointer compression 配置没有在这个入口验收。
+bounded Maglev producer 已通过 Forgejo107 完整构建和30 native；TF返回后异常检查削减曾通过Forgejo108的32项native与消费者原门禁，但ABBA未证实收益，生产增量已撤回。两项TF跨tier正确性/终止回归长期保留，恢复后的32项真实结果待下一对应CI。成套artifact以该head成功CI为准；其他平台、Debug、sandbox、pointer compression配置尚未验收。
