@@ -1,5 +1,11 @@
 # 变更记录
 
+## [2026-10-14] 实验复用 bounded TF 的 native 调用地址
+
+- 713真实汇编及767选指令表明TF分别为profiler target发布和C-call物化同一native地址；新单变量仅为合格的bounded void/i32叶descriptor禁用immediate选择，复用既有非固定寄存器C-call路径。
+- selection-only标志受Linuxx64、非simulator、双sandbox关闭、ordinaryJS/有效FrameState/非Turbolev及完整signature/contract限制；默认路径、ABI、effects、FP/PC/SP/context/target、异常/中断保持。四文件源码非作者独审通过，尚未编译或证明实际地址复用及收益。
+- 原34长期native逐项保留；现有v8_unittests增加两个selector配对回归，准确运行各1test并总计36才产包，不新增target/cache。单缓存下真实头文件变化会触发依赖重编；最多一份候选seed，不预建副本。
+
 ## [2026-10-14] 撤回未满足 FFI 门禁的 early OSR 候选
 
 - 767完整34 native、消费395测试及原HTTP通过，但原FFI identity16516超过15200；测后外部编译负载使收益归因未知，停止file/ABBA，不追加采样挑绿。

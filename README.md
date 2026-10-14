@@ -22,14 +22,16 @@
 
 ## 长期 native gates
 
-原26项逐项保留：context14、Fast API/profiler9、termination3；另加 `test-api/FastApiCallsWithoutReceiver`，合计27项。bounded 另有3项 Maglev 与2项 TurboFan 回归，再加2项受限 early OSR peeling 回归，总34项；全部通过才打包。
+原26项逐项保留：context14、Fast API/profiler9、termination3；另加 `test-api/FastApiCallsWithoutReceiver`，合计27项。bounded 另有3项 Maglev 与2项 TurboFan 回归，再加2项永久OSR语义回归与2项C-call目标选择回归，总36项；全部通过才打包。
 
 - context：两个 guarded OSR case、Load/Store NoCell各四项、四个 SpecializeJSFunction case。
 - Fast API：原8个 test-api case 与 FastApiCPUProfiler；新增 receiverless case 覆盖 void()/i32(i32)、实际 fast 计数和 slow/string fallback。
 - termination：原三个 ThreadTerminationTest filter。
 - early OSR：FastApiBoundedNativeEarlyOsrPeeling 与 FastApiBoundedNativeEarlyOsrPeelingTermination，覆盖当前TF帧、剩余零/一/多轮、错误与溢出、call后GC/lazydeopt次数、嵌套fallback和终止取消恢复。跨i32边界不等于已证明eager deopt；具体peeling与Word32表示另由消费图验证。
 
-脚本先检查 cctest 的实际列表，逐项按完整 selector 运行；termination 每项必须报告一个通过的测试。缺 case、零测试、native失败或超时都会阻断打包与上传。准确 selector 和命令直接保留在同一长期构建脚本，不维护第二份 runner。
+脚本先检查 cctest 的实际列表，逐项按完整 selector 运行；termination与selector每项必须报告一个通过的测试。缺 case、零测试、native失败或超时都会阻断打包与上传。准确 selector 和命令直接保留在同一长期构建脚本，不维护第二份 runner。
+
+新增selector回归逐项检查marked C descriptor使用非fixed寄存器、默认仍用立即数，且selection-only标志不进入backend编码；沿既有v8_unittests运行，不新增测试target。
 
 这些 native gates 不替代 lo-bun correctness、原 HTTP/FFI/file 门禁或 runtime 消费验收。新增 kNo 测试不表示正式 runtime 已切换 receiverless 接线；首轮消费者仍保留原 kYes wiring。
 
@@ -52,10 +54,10 @@ v8/
   build-info/              实际 args、source/toolchain 与 native测试输出
 ```
 
-Rust rsp 内的 `v8/rust-rlibs/...` 从消费者 seed 根目录解释。headers、gen、monolith 和 Rust closure 必须整套消费，不能选取单个压缩包与旧版本拼接。实际 GN args、effective args/defines、source/toolchain版本与全部32项结果在 build-info；失败任务不会上传成可消费的成功 seed。
+Rust rsp 内的 `v8/rust-rlibs/...` 从消费者 seed 根目录解释。headers、gen、monolith 和 Rust closure 必须整套消费，不能选取单个压缩包与旧版本拼接。实际 GN args、effective args/defines、source/toolchain版本与全部native结果在 build-info；失败任务不会上传成可消费的成功 seed。
 
 本产物只负责 V8 引擎部分。消费者必须用该套新 headers **重编所有 V8 wrapper 和 napi_impl**，不得直接复用依赖旧 V8 ABI 的 `.o`；无 V8 依赖的纯 C/C++第三方库可按原消费合同复用。full native source/closure 的组装、最终 runtime 链接及测试由 lo-bun producer 持有，不推给本 fork 的 CI。
 
 ## 验证边界
 
-bounded Maglev producer 已通过 Forgejo107 完整构建和30 native；TF返回后异常检查削减曾通过Forgejo108的32项native与消费者原门禁，但ABBA未证实收益，生产增量已撤回。两项TF跨tier正确性/终止回归长期保留，恢复后的32项真实结果待下一对应CI。成套artifact以该head成功CI为准；其他平台、Debug、sandbox、pointer compression配置尚未验收。
+成套artifact以精确head的成功CI为准，原生门禁不代替真实runtime性能验收。其他平台、Debug、sandbox、pointer compression配置须独立验证。
