@@ -1,5 +1,10 @@
 # 变更记录
 
+## [2026-10-14] 修正 selector 回归的只读 Instruction 指针
+
+- Forgejo113的337目标构建中，新selector测试helper因Stream返回const Instruction*、局部指针漏const而失败，未运行完整36或产包。
+- 仅局部指针补const，保三生产文件/全部断言/原36及cachemtime修正；静态检查与非作者接口独审通过，复用当前单cache重新执行完整门禁，不把已编对象或旧绿当验收。
+
 ## [2026-10-14] 实验复用 bounded TF 的 native 调用地址
 
 - 713真实汇编及767选指令表明TF分别为profiler target发布和C-call物化同一native地址；新单变量仅为合格的bounded void/i32叶descriptor禁用immediate选择，复用既有非固定寄存器C-call路径。

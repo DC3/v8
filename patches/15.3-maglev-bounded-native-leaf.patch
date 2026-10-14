@@ -1239,7 +1239,7 @@ index 17711879..09b20ab3 100644
  #if !defined(V8_LITE_MODE) && defined(V8_ENABLE_TURBOFAN)
    if (i::v8_flags.jitless) return;
 diff --git a/test/unittests/compiler/x64/turboshaft-instruction-selector-x64-unittest.cc b/test/unittests/compiler/x64/turboshaft-instruction-selector-x64-unittest.cc
-index e2781639..46f1ea71 100644
+index e2781639..93ac4b03 100644
 --- a/test/unittests/compiler/x64/turboshaft-instruction-selector-x64-unittest.cc
 +++ b/test/unittests/compiler/x64/turboshaft-instruction-selector-x64-unittest.cc
 @@ -5,8 +5,10 @@
@@ -1281,7 +1281,7 @@ index e2781639..46f1ea71 100644
 +                  descriptor));
 +  auto s =
 +      m.Build(TurboshaftInstructionSelectorTest::kAllExceptNopInstructions);
-+  Instruction* call = nullptr;
++  const Instruction* call = nullptr;
 +  size_t call_count = 0;
 +  for (size_t i = 0; i < s.size(); ++i) {
 +    if (s[i]->arch_opcode() == kArchCallCFunction) {
