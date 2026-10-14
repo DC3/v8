@@ -1,5 +1,11 @@
 # 变更记录
 
+## [2026-10-14] 结束 TF 地址复用候选并恢复已验证源码
+
+- 114真实36、消费者395测试和实际sample机器码均通过；重复地址物化确已消失且无新增等价move/spill，但原FFI诊断identity15523高于15200，未获性能KEEP，不补采或外推稳定退化。
+- 精确恢复031a489同patch与buildscript，保34语义/mtimecache修正；仅去本次地址复用及两selector回归，README保稳定34说明，独审通过。
+- 相同源码及脚本在778已真实34通过，本次不重复dispatch产物；不宣新producer exact-head CI通过，下一真实实现仍须完整检查。失败大产物已精确清理，仅保小结论与基线。
+
 ## [2026-10-14] 修正 selector 回归的只读 Instruction 指针
 
 - Forgejo113的337目标构建中，新selector测试helper因Stream返回const Instruction*、局部指针漏const而失败，未运行完整36或产包。

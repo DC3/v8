@@ -22,16 +22,14 @@
 
 ## 长期 native gates
 
-原26项逐项保留：context14、Fast API/profiler9、termination3；另加 `test-api/FastApiCallsWithoutReceiver`，合计27项。bounded 另有3项 Maglev 与2项 TurboFan 回归，再加2项永久OSR语义回归与2项C-call目标选择回归，总36项；全部通过才打包。
+原26项逐项保留：context14、Fast API/profiler9、termination3；另加 `test-api/FastApiCallsWithoutReceiver`，合计27项。bounded 另有3项 Maglev 与2项 TurboFan 回归，再加2项永久OSR语义回归，总34项；全部通过才打包。
 
 - context：两个 guarded OSR case、Load/Store NoCell各四项、四个 SpecializeJSFunction case。
 - Fast API：原8个 test-api case 与 FastApiCPUProfiler；新增 receiverless case 覆盖 void()/i32(i32)、实际 fast 计数和 slow/string fallback。
 - termination：原三个 ThreadTerminationTest filter。
-- early OSR：FastApiBoundedNativeEarlyOsrPeeling 与 FastApiBoundedNativeEarlyOsrPeelingTermination，覆盖当前TF帧、剩余零/一/多轮、错误与溢出、call后GC/lazydeopt次数、嵌套fallback和终止取消恢复。跨i32边界不等于已证明eager deopt；具体peeling与Word32表示另由消费图验证。
+- OSR语义：FastApiBoundedNativeEarlyOsrPeeling 与 FastApiBoundedNativeEarlyOsrPeelingTermination，覆盖当前TF帧、剩余零/一/多轮、错误与溢出、call后GC/lazydeopt次数、嵌套fallback和终止取消恢复。跨i32边界不等于已证明eager deopt；保留case名不表示生产启用early OSR peeling。
 
-脚本先检查 cctest 的实际列表，逐项按完整 selector 运行；termination与selector每项必须报告一个通过的测试。缺 case、零测试、native失败或超时都会阻断打包与上传。准确 selector 和命令直接保留在同一长期构建脚本，不维护第二份 runner。
-
-新增selector回归逐项检查marked C descriptor使用非fixed寄存器、默认仍用立即数，且selection-only标志不进入backend编码；沿既有v8_unittests运行，不新增测试target。
+脚本先检查 cctest 的实际列表，逐项按完整 selector 运行；termination 每项必须报告一个通过的测试。缺 case、零测试、native失败或超时都会阻断打包与上传。准确 selector 和命令直接保留在同一长期构建脚本，不维护第二份 runner。
 
 这些 native gates 不替代 lo-bun correctness、原 HTTP/FFI/file 门禁或 runtime 消费验收。新增 kNo 测试不表示正式 runtime 已切换 receiverless 接线；首轮消费者仍保留原 kYes wiring。
 

@@ -371,15 +371,6 @@ for task_case in FastApiBoundedNativeEarlyOsrPeeling FastApiBoundedNativeEarlyOs
   run_cctest "test-api/$task_case"
 done
 test "$task_native_count" -eq 34
-for task_case in FastApiCallRegisterTarget FastApiCallDefaultImmediateTarget; do
-  timeout --signal=TERM --kill-after=10s 300s "$task_out/v8_unittests" \
-    "--gtest_filter=TurboshaftInstructionSelectorTest.$task_case" --gtest_color=no \
-    | tee "$task_info/selector-$task_case.log"
-  grep -Fxq '[  PASSED  ] 1 test.' "$task_info/selector-$task_case.log"
-  printf 'PASS TurboshaftInstructionSelectorTest.%s\n' "$task_case" | tee -a "$task_info/native-gates.txt"
-  task_native_count=$((task_native_count + 1))
-done
-test "$task_native_count" -eq 36
 printf 'TOTAL_PASS=%s\n' "$task_native_count" >> "$task_info/native-gates.txt"
 
 # Existing seed paths: the rsp is interpreted from the consumer seed root.
