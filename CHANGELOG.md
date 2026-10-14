@@ -1,5 +1,10 @@
 # 变更记录
 
+## [2026-10-14] 修正 callee-saved 单测的固定端点预期
+
+- Forgejo116/API818完整编译、原34及新增真实TF/GC/deopt共35项通过；第36项regalloc仅RBX位置断言失败，未打包或消费候选产物。现有binary单次诊断重复同一失败，trace未给出具体寄存器重定位，不宣生产故障或新PASS。
+- 固定寄存器只约束定义和使用端点；改为marked/default同两个GP与FP输入，比较START/END非冗余栈到GP恢复数，保caller-saved、FP、默认恢复及实际verifier。生产六文件保持冻结，下一cached CI完整36重做，不新增target/cache/诊断设施。
+
 ## [2026-10-14] 实验复用 TF bounded NoVM 的 ABI 保留寄存器
 
 - 仅Linuxx64普通TF/非Turbolev/有效FrameState及原受限signature完整NoVM合同，为被选中callee传selection-only descriptor标志到Instruction；allocator与verifier同一ABI∩allocatable GP判据，保IsCall/FPR/temps/默认调用及全部ABI/state/effects/FrameState栈约束。

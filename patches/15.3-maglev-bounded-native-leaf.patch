@@ -1407,10 +1407,10 @@ index 17711879..6ea30a08 100644
  #if !defined(V8_LITE_MODE) && defined(V8_ENABLE_TURBOFAN)
    if (i::v8_flags.jitless) return;
 diff --git a/test/unittests/compiler/regalloc/register-allocator-unittest.cc b/test/unittests/compiler/regalloc/register-allocator-unittest.cc
-index 875088a2..67e84414 100644
+index 875088a2..94249126 100644
 --- a/test/unittests/compiler/regalloc/register-allocator-unittest.cc
 +++ b/test/unittests/compiler/regalloc/register-allocator-unittest.cc
-@@ -115,6 +115,66 @@ TEST_F(RegisterAllocatorTest, CanAllocateThreeRegisters) {
+@@ -115,6 +115,80 @@ TEST_F(RegisterAllocatorTest, CanAllocateThreeRegisters) {
    Allocate();
  }
  
@@ -1432,7 +1432,9 @@ index 875088a2..67e84414 100644
 +  Instruction* ordinary = Instruction::New(zone(), kArchCallCFunction);
 +  ordinary->MarkAsCall();
 +  sequence()->AddInstruction(ordinary);
-+  Instruction* ordinary_use = EmitI(Reg(saved, rbx.code()));
++  Instruction* ordinary_use =
++      EmitI(Reg(saved, rbx.code()), Reg(caller_saved, rdx.code()),
++            Reg(fp, xmm1.code()));
 +  EndBlock(Last());
 +
 +  // Allocate() runs the existing allocation verifier as well.
@@ -1441,6 +1443,8 @@ index 875088a2..67e84414 100644
 +  EXPECT_TRUE(bounded->ClobbersDoubleRegisters());
 +  EXPECT_TRUE(bounded->ClobbersTemps());
 +  bool caller_reload = false, fp_reload = false, ordinary_reload = false;
++  bool ordinary_fp_reload = false;
++  int bounded_gp_stack_reloads = 0, ordinary_gp_stack_reloads = 0;
 +  for (Instruction::GapPosition gap : {Instruction::START, Instruction::END}) {
 +    if (const ParallelMove* moves = bounded_use->GetParallelMove(gap)) {
 +      for (const MoveOperands* move : *moves) {
@@ -1448,7 +1452,7 @@ index 875088a2..67e84414 100644
 +        const InstructionOperand& destination = move->destination();
 +        if (destination.IsRegister()) {
 +          int code = LocationOperand::cast(destination).register_code();
-+          EXPECT_NE(rbx.code(), code);
++          bounded_gp_stack_reloads += move->source().IsStackSlot();
 +          caller_reload |=
 +              code == rdx.code() &&
 +              (move->source().IsStackSlot() || move->source().IsRegister());
@@ -1460,6 +1464,10 @@ index 875088a2..67e84414 100644
 +    if (const ParallelMove* moves = ordinary_use->GetParallelMove(gap)) {
 +      for (const MoveOperands* move : *moves) {
 +        if (move->IsEliminated() || move->IsRedundant()) continue;
++        ordinary_gp_stack_reloads +=
++            move->destination().IsRegister() && move->source().IsStackSlot();
++        ordinary_fp_reload |= move->destination().IsDoubleRegister() &&
++                              move->source().IsFPStackSlot();
 +        ordinary_reload |=
 +            move->destination().IsRegister() &&
 +            LocationOperand::cast(move->destination()).register_code() ==
@@ -1471,6 +1479,12 @@ index 875088a2..67e84414 100644
 +  EXPECT_TRUE(caller_reload);
 +  EXPECT_TRUE(fp_reload);
 +  EXPECT_TRUE(ordinary_reload);
++  EXPECT_TRUE(ordinary_fp_reload);
++  // Fixed use locations do not pin a live value to that register across the
++  // call. Compare the same two live GP values instead: at least one survives
++  // the bounded call in a register, whereas the ordinary call spills both.
++  EXPECT_EQ(2, ordinary_gp_stack_reloads);
++  EXPECT_LT(bounded_gp_stack_reloads, 2);
 +#endif
 +}
 +
