@@ -201,9 +201,15 @@ if $task_recorded && ! $task_same_patches; then
 fi
 # Always let gclient check its complete package graph. Its existing downloads
 # are reused; no --force/--reset/--delete_unversioned_trees is permitted here.
+task_sync_args=(--no-history --jobs 2)
+if ! $task_recorded || ! $task_same_patches; then
+  task_sync_args+=(--revision "v8@$task_revision")
+fi
+# An unchanged, verified patched root must retain managed=False's unmanaged
+# mode; forcing a revision makes gclient reject that known source diff.
 (
   cd "$task_build"
-  gclient sync --no-history --jobs 2 --revision "v8@$task_revision"
+  gclient sync "${task_sync_args[@]}"
 )
 check_checkout "$task_source" "$task_revision"
 check_dependencies required

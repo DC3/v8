@@ -1,5 +1,10 @@
 # 变更记录
 
+## [2026-10-14] 修正相同补丁缓存的 gclient 同步模式
+
+- Forgejo105 在依赖同步阶段因强制指定 V8 revision 而拒绝已有补丁的工作区，尚未进入 native 构建。仅对已核验且四份补丁逐字相同的缓存省略 revision 覆盖，沿既有 managed=False 保持 V8 根 HEAD；初建或补丁变化恢复干净源码后仍显式固定 revision。
+- 使用参数数组保留完整 Git/CIPD/GCS 依赖与 hooks 同步、同步前后源码检查、原构建目标和全部 30 项 native 门禁；不使用 force/reset 或跳过依赖。静态检查后交独审，真实缓存构建结果待主控验收。
+
 ## [2026-10-14] 修正 bounded native 永久回归的 V8 15.3 接线
 
 - Forgejo104 已越过 optimizer visitor 链接缺口，后在 test-api 的 Context::GetIsolate 编译失败；改为同版 LocalContext 默认使用的 CcTest::isolate，保留局部 HandleScope 和全部原生断言。
