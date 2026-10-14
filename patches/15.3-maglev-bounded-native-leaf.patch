@@ -420,7 +420,7 @@ index cca74ccc..44fc024b 100644
    return MaglevAssembler::ArgumentStackSlotsForCFunctionCall(1);
  }
 diff --git a/test/cctest/test-api.cc b/test/cctest/test-api.cc
-index 17711879..8033d434 100644
+index 17711879..9247b43c 100644
 --- a/test/cctest/test-api.cc
 +++ b/test/cctest/test-api.cc
 @@ -28,8 +28,10 @@
@@ -450,7 +450,7 @@ index 17711879..8033d434 100644
  #include "src/objects/feedback-vector-inl.h"
  #include "src/objects/feedback-vector.h"
  #include "src/objects/hash-table-inl.h"
-@@ -29924,6 +29928,795 @@ TEST(FastApiCallsWithoutReceiver) {
+@@ -29924,6 +29928,797 @@ TEST(FastApiCallsWithoutReceiver) {
  #endif
  }
  
@@ -1105,11 +1105,11 @@ index 17711879..8033d434 100644
 +      }
 +      return total;
 +    }
-+    function osrNested(count) {
++    function osrNested(count, requestOsr) {
 +      let total = 0;
 +      for (let i = 0; i < count; ++i) {
 +        for (let j = 0; j < 2; ++j) {
-+          if (i === 0 && j === 0) %OptimizeOsr();
++          if (requestOsr && i === 0 && j === 0) %OptimizeOsr();
 +          total += strictIdentity(31);
 +        }
 +      }
@@ -1123,7 +1123,9 @@ index 17711879..8033d434 100644
 +    osrStrict(0, -1);
 +    osrOverflow(1, false);
 +    afterLeaf(4, false);
-+    osrNested(0);
++    osrNested(0, false);
++    // Prime both increments before requesting OSR in the nested fallback.
++    osrNested(1, false);
 +  )JS");
 +  bounded_i32_fast = bounded_i32_slow = 0;
 +  ExpectTrue("osrStrict(0, -1)[0] === 0");
@@ -1186,7 +1188,7 @@ index 17711879..8033d434 100644
 +
 +  // Nested loops remain eligible only for the existing late pipeline.
 +  bounded_i32_fast = bounded_i32_slow = 0;
-+  CompileRun("var nestedResult = osrNested(4);");
++  CompileRun("var nestedResult = osrNested(4, true);");
 +  ExpectTrue("nestedResult[0] === 248 && nestedResult[1]");
 +  CHECK_EQ(8, bounded_i32_fast + bounded_i32_slow);
 +  CHECK_GT(bounded_i32_fast, 0);

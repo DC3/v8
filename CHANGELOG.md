@@ -1,5 +1,11 @@
 # 变更记录
 
+## [2026-10-14] 补全嵌套 OSR 回归的外层反馈
+
+- 760实际消费SFI回调，afterLeaf lazydeopt检查通过；最后nested用例只预热零轮，innerOSR后在外层i++因unary feedback不足退出TF，未产包。
+- 仅测试增加requestOsr参数，以false预热一轮两层循环后正式true触发OSR；结果248、返回TF、8次调用及fast>0和其他断言保持。生产pipeline/stat逐字冻结，既有34项和cache脚本mtime修正保留。
+- source静态检查通过，真实全部34项、消费图及性能仍待验；复用单cache，不增加seed或另建缓存。
+
 ## [2026-10-14] 保留更新补丁时未变源码的 Ninja 缓存
 
 - 760仅测试变化仍重编1590目标，定位完整reverse/apply重写未变头文件mtime。仅cached/recorded/patch变化时，在本轮输出里临时快照旧diff源文件；完整sync/apply及原校验后，仅byte-identical恢复原纳秒mtime，再精确清理快照。
