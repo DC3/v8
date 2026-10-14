@@ -371,6 +371,14 @@ for task_case in FastApiBoundedNativeEarlyOsrPeeling FastApiBoundedNativeEarlyOs
   run_cctest "test-api/$task_case"
 done
 test "$task_native_count" -eq 34
+run_cctest test-api/FastApiBoundedNativeTurboFanCalleeSaved
+timeout --signal=TERM --kill-after=10s 300s "$task_out/v8_unittests" \
+  --gtest_filter=RegisterAllocatorTest.BoundedNativeCalleeSavedRegisters --gtest_color=no \
+  | tee "$task_info/bounded-callee-saved-registers.log"
+grep -Fxq '[  PASSED  ] 1 test.' "$task_info/bounded-callee-saved-registers.log"
+printf 'PASS RegisterAllocatorTest.BoundedNativeCalleeSavedRegisters\n' | tee -a "$task_info/native-gates.txt"
+task_native_count=$((task_native_count + 1))
+test "$task_native_count" -eq 36
 printf 'TOTAL_PASS=%s\n' "$task_native_count" >> "$task_info/native-gates.txt"
 
 # Existing seed paths: the rsp is interpreted from the consumer seed root.

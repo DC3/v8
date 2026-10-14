@@ -1,5 +1,12 @@
 # 变更记录
 
+## [2026-10-14] 实验复用 TF bounded NoVM 的 ABI 保留寄存器
+
+- 仅Linuxx64普通TF/非Turbolev/有效FrameState及原受限signature完整NoVM合同，为被选中callee传selection-only descriptor标志到Instruction；allocator与verifier同一ABI∩allocatable GP判据，保IsCall/FPR/temps/默认调用及全部ABI/state/effects/FrameState栈约束。
+- 首版只尝试省两reload，保FrameState栈副本；精确NoVM无GC/VM/reentry/unlock/interrupt是安全依据，不从栈副本推所有tagged都有root，不扩大safepoint或NoAllocate语义。
+- 原34保留，现有cctest及regalloc unit各增加一项，真实TF压力/对象身份/随后GCdeopt/default和FP对照、exactlyonce及verifier均有断言；全部36后打包，不增target/cache。源码与两测试/脚本已非作者独审，实际native/机器码/收益尚待验。
+- 两项静态纠偏已在CI前完成：release可用Turbolev判据、合法GP到GP恢复预期；生产与测试断言未降低。单cache/单候选，失败精确撤回和清理。
+
 ## [2026-10-14] 结束 fresh arguments 候选并撤回生产实现
 
 - Forgejo115/API807实际36、百万43M及完整396测试/7956断言通过；实际sample Maglev成功回边完整消除40B arguments和24B backing，未转移到native helper，非作者机械独审通过。
