@@ -1,5 +1,11 @@
 # 变更记录
 
+## [2026-10-14] 修正 OSR 回归测试的实际退优化触发
+
+- Forgejo109编译及原32项native通过，新增OSR用例在GC后tier断言失败；现场和单回trace确认普通入口intrinsic未失效OSR-only代码，未产包或消费。
+- 仅测试callback按afterLeaf的SharedFunctionInfo调用已有全优化代码失效方法，覆盖普通入口与OSR；保GC、返回值、lazydeopt和exactly-once断言，生产pipeline及统计条目逐字不变。
+- 原32及新增两项全部34项仍须在下一真实CI重做；复用单cache，不新增构建副本，未宣机制命中或性能收益。
+
 ## [2026-10-14] 实验内联前受限 OSR 循环剥离
 
 - 原713实际图显示严格wrapper冷Throw出口阻止late peeling；保原wrapper/callee/effects/调用安全状态，新增普通TF、OSR及原peeling开启时的窄earlyphase，复用trivial Phi清理、cached-root trimming、LoopFinder与Peel(loop)。

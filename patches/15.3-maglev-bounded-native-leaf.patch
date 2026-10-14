@@ -420,7 +420,7 @@ index cca74ccc..44fc024b 100644
    return MaglevAssembler::ArgumentStackSlotsForCFunctionCall(1);
  }
 diff --git a/test/cctest/test-api.cc b/test/cctest/test-api.cc
-index 17711879..2a6cd331 100644
+index 17711879..8033d434 100644
 --- a/test/cctest/test-api.cc
 +++ b/test/cctest/test-api.cc
 @@ -28,8 +28,10 @@
@@ -434,7 +434,15 @@ index 17711879..2a6cd331 100644
  #include <map>
  #include <memory>
  #include <optional>
-@@ -75,6 +77,7 @@
+@@ -66,6 +68,7 @@
+ #include "src/codegen/compilation-cache.h"
+ #include "src/common/globals.h"
+ #include "src/compiler/globals.h"
++#include "src/deoptimizer/deoptimizer.h"
+ #include "src/execution/execution.h"
+ #include "src/execution/futex-emulation.h"
+ #include "src/execution/protectors-inl.h"
+@@ -75,6 +78,7 @@
  #include "src/heap/incremental-marking.h"
  #include "src/init/v8.h"
  #include "src/logging/metrics.h"
@@ -442,7 +450,7 @@ index 17711879..2a6cd331 100644
  #include "src/objects/feedback-vector-inl.h"
  #include "src/objects/feedback-vector.h"
  #include "src/objects/hash-table-inl.h"
-@@ -29924,6 +29927,787 @@ TEST(FastApiCallsWithoutReceiver) {
+@@ -29924,6 +29928,795 @@ TEST(FastApiCallsWithoutReceiver) {
  #endif
  }
  
@@ -537,7 +545,15 @@ index 17711879..2a6cd331 100644
 +  ++unmarked_i32_slow;
 +  if (unmarked_gc) i::heap::InvokeMajorGC(CcTest::heap());
 +  CheckBoundedCallbackData(info);
-+  if (unmarked_deopt) CompileRun("%DeoptimizeFunction(afterLeaf)");
++  if (unmarked_deopt) {
++    // OSR code is not attached to the function's normal entry. Invalidate
++    // all optimized code for this function, including its active OSR code.
++    auto function = i::Cast<i::JSFunction>(
++        v8::Utils::OpenDirectHandle(*CompileRun("afterLeaf")));
++    i::Isolate* isolate = CcTest::i_isolate();
++    i::Deoptimizer::DeoptimizeAllOptimizedCodeWithFunction(
++        isolate, i::direct_handle(function->shared(), isolate));
++  }
 +  info.GetReturnValue().Set(info[0]);
 +}
 +
