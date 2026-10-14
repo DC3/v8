@@ -1,5 +1,10 @@
 # 变更记录
 
+## [2026-10-14] 实验消除 fresh arguments 的只读分配
+
+- 依据实际sample每轮40B参数对象和24B内部数组分配，仅在默认关闭object tracking时为普通Maglev中新建未逃逸plain arguments及唯一内部FixedArray启用只读virtual字段和常量length复用；写入、mapped参数、parent逃逸与跨循环旧对象继续原路径。原flag开启路径、FFI合同、effects、FrameState与回边poll保持。
+- 复用现有test-api/cctest增加读取及失效两项长期回归，原34项保留，完整36逐项通过才打包；不新增target/cache，实际编译、原生回归和消费者机械/性能均待验证，不宣性能收益。
+
 ## [2026-10-14] 结束 TF 地址复用候选并恢复已验证源码
 
 - 114真实36、消费者395测试和实际sample机器码均通过；重复地址物化确已消失且无新增等价move/spill，但原FFI诊断identity15523高于15200，未获性能KEEP，不补采或外推稳定退化。

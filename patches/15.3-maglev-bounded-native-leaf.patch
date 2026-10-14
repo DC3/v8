@@ -93,7 +93,7 @@ index 7e33f630..7900a476 100644
                                  const maglev::ProcessingState& state) {
      GET_FRAME_STATE_MAYBE_ABORT(frame_state, node->lazy_deopt_info());
 diff --git a/src/maglev/maglev-graph-builder.cc b/src/maglev/maglev-graph-builder.cc
-index 88ede661..6831d2a2 100644
+index 88ede661..d30d5061 100644
 --- a/src/maglev/maglev-graph-builder.cc
 +++ b/src/maglev/maglev-graph-builder.cc
 @@ -11,6 +11,7 @@
@@ -104,7 +104,104 @@ index 88ede661..6831d2a2 100644
  #include "src/base/bits.h"
  #include "src/base/bounds.h"
  #include "src/base/container-utils.h"
-@@ -10968,6 +10969,51 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceCallForApiFunction(
+@@ -3878,9 +3879,52 @@ bool VerifyIsNotEscaping(VirtualObjectList vos, InlinedAllocation* alloc) {
+ bool MaglevGraphBuilder::CanTrackObjectChanges(ValueNode* receiver,
+                                                TrackObjectMode mode) {
+   DCHECK(!receiver->Is<VirtualObject>());
+-  if (!v8_flags.maglev_object_tracking) return false;
+   if (!receiver->Is<InlinedAllocation>()) return false;
+   InlinedAllocation* alloc = receiver->Cast<InlinedAllocation>();
++  if (!v8_flags.maglev_object_tracking) {
++    // Only read fresh, unaliased arguments and their private backing store.
++    // Stores still escape instead of updating the virtual object.
++    if (mode != TrackObjectMode::kLoad || is_turbolev() || !is_inline()) {
++      return false;
++    }
++    auto fresh_arguments = [&](InlinedAllocation* candidate) -> VirtualObject* {
++      if (IsEscaping(candidate)) return nullptr;
++      auto parents = graph_->allocations_elide_map().find(candidate);
++      if (parents != graph_->allocations_elide_map().end() &&
++          !parents->second.empty()) {
++        return nullptr;
++      }
++      if (IsInsideLoop() && (!is_loop_effect_tracking() ||
++                             !loop_effects_->allocations.contains(candidate))) {
++        return nullptr;
++      }
++      VirtualObject* object = GetObjectFromAllocation(candidate);
++      if (!object || !object->has_static_map()) return nullptr;
++      compiler::MapRef map = *object->map();
++      auto native_context = broker()->target_native_context();
++      if (!map.equals(native_context.sloppy_arguments_map(broker())) &&
++          !map.equals(native_context.strict_arguments_map(broker()))) {
++        return nullptr;
++      }
++      return object;
++    };
++    VirtualObject* object = GetObjectFromAllocation(alloc);
++    if (!object || !object->has_static_map()) return false;
++    if (object->map()->equals(broker()->fixed_array_map())) {
++      auto parents = graph_->allocations_elide_map().find(alloc);
++      if (parents == graph_->allocations_elide_map().end() ||
++          parents->second.size() != 1) {
++        return false;
++      }
++      VirtualObject* arguments = fresh_arguments(parents->second.front());
++      if (!arguments ||
++          arguments->get(offsetof(JSObject, elements_)) != alloc) {
++        return false;
++      }
++    } else if (!fresh_arguments(alloc)) {
++      return false;
++    }
++  }
+   if (IsEscaping(alloc)) return false;
+   if (mode == TrackObjectMode::kStore) {
+     // If we have two objects A and B, such that A points to B (it contains B in
+@@ -3981,12 +4025,20 @@ MaglevGraphBuilder::TryBuildLoadTaggedFieldFromAllocation(ValueNode* object,
+   // loads, and missed JSArray elements kind transitions. We should understand
+   // whether this is an issue with --maglev-object-tracking.
+   if (offset == offsetof(HeapObject, map_)) return std::nullopt;
+-  if (!(IsFieldConstant(object, offset) ||
++  const bool is_field_constant = IsFieldConstant(object, offset);
++  if (!(is_field_constant ||
+         CanTrackObjectChanges(object, TrackObjectMode::kLoad))) {
+     return std::nullopt;
+   }
+   VirtualObject* vobject =
+       GetObjectFromAllocation(object->Cast<InlinedAllocation>());
++  if (!v8_flags.maglev_object_tracking && !is_field_constant &&
++      (!vobject || offset < 0 ||
++       static_cast<size_t>(offset) >= vobject->size() ||
++       offset % kTaggedSize != 0 ||
++       vobject->FieldForOffset(offset).type != vobj::FieldType::kTagged)) {
++    return std::nullopt;
++  }
+   CHECK_EQ(vobject->FieldForOffset(offset).type, vobj::FieldType::kTagged);
+   ValueNode* value = vobject->get(offset);
+   if (v8_flags.trace_maglev_object_tracking) {
+@@ -4379,6 +4431,20 @@ ValueNode* MaglevGraphBuilder::BuildLoadFixedArrayLength(
+   // We won't try to reason about the type of the FixedArray and thus also
+   // cannot end up with an empty type for it.
+   DCHECK(!IsEmptyNodeType(GetType(fixed_array)));
++  if (!v8_flags.maglev_object_tracking &&
++      CanTrackObjectChanges(fixed_array, TrackObjectMode::kLoad)) {
++    VirtualObject* object =
++        GetObjectFromAllocation(fixed_array->Cast<InlinedAllocation>());
++    if (object && object->map()->equals(broker()->fixed_array_map()) &&
++        object->FieldForOffset(FixedArrayBase::kLengthOffset).type ==
++            vobj::FieldType::kInt32) {
++      if (auto* length = object->get(FixedArrayBase::kLengthOffset)
++                             ->TryCast<Int32Constant>();
++          length && length->value() >= 0) {
++        return length;
++      }
++    }
++  }
+   ValueNode* length;
+   GET_VALUE(length, AddNewNode<LoadInt32>(
+                         {fixed_array},
+@@ -10968,6 +11034,51 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceCallForApiFunction(
  
    ValueNode* tagged_receiver;
    GET_VALUE_OR_ABORT(tagged_receiver, GetTaggedValue(receiver));
@@ -321,7 +418,7 @@ index cca74ccc..44fc024b 100644
    return MaglevAssembler::ArgumentStackSlotsForCFunctionCall(1);
  }
 diff --git a/test/cctest/test-api.cc b/test/cctest/test-api.cc
-index 17711879..09b20ab3 100644
+index 17711879..49383015 100644
 --- a/test/cctest/test-api.cc
 +++ b/test/cctest/test-api.cc
 @@ -28,8 +28,10 @@
@@ -351,7 +448,7 @@ index 17711879..09b20ab3 100644
  #include "src/objects/feedback-vector-inl.h"
  #include "src/objects/feedback-vector.h"
  #include "src/objects/hash-table-inl.h"
-@@ -29924,6 +29928,798 @@ TEST(FastApiCallsWithoutReceiver) {
+@@ -29924,6 +29928,1077 @@ TEST(FastApiCallsWithoutReceiver) {
  #endif
  }
  
@@ -1144,6 +1241,285 @@ index 17711879..09b20ab3 100644
 +  ExpectFalse("boundedCaught || boundedAfter");
 +  CHECK(CompileRun("boundedNoop()")->IsUndefined());
 +  ExpectInt32("strictIdentity(31)", 31);
++#endif
++}
++
++TEST(MaglevFreshArgumentsReadOnlyLoads) {
++#if defined(V8_ENABLE_MAGLEV) && defined(V8_TARGET_ARCH_X64) && V8_OS_LINUX && \
++    !defined(USE_SIMULATOR)
++  if (i::v8_flags.jitless || i::v8_flags.disable_optimizing_compilers) return;
++  BoundedNativeMaglevTest flags;
++  i::FlagScope<bool> tracking(&i::v8_flags.maglev_object_tracking, false);
++  i::FlagScope<bool> escape(&i::v8_flags.maglev_escape_analysis, true);
++  i::FlagScope<int> inline_size(&i::v8_flags.max_maglev_inlined_bytecode_size,
++                                300);
++  v8::HandleScope scope(CcTest::isolate());
++  LocalContext env;
++  flags.Install(env.local(), true);
++  CompileRun(R"JS(
++    var freshPayload = { value: 31 };
++    function freshPlain() {
++      if (arguments.length === 0) return 0;
++      return boundedIdentity(arguments[0]) + arguments.length;
++    }
++    function freshStrict() {
++      'use strict';
++      if (arguments.length === 0) return 0;
++      return boundedIdentity(arguments[0]) + arguments.length;
++    }
++    function freshObject() {
++      'use strict';
++      if (arguments.length !== 2 || arguments[0] !== arguments[1]) return -1;
++      return boundedIdentity(arguments[0].value);
++    }
++    function readZero() { return freshPlain(); }
++    function readStrictZero() { return freshStrict(); }
++    function readPlain() { return freshPlain(31); }
++    function readMulti() { return freshPlain(31, 7, 9); }
++    function readStrict() { return freshStrict(31, 7); }
++    function readObject(value) { return freshObject(value, value); }
++    function readLoop() {
++      let total = 0;
++      for (let i = 0; i < 4; ++i) total += freshPlain(31);
++      return total;
++    }
++    function freshAfterLeaf() {
++      'use strict';
++      const retained = arguments[0];
++      const result = boundedIdentity(retained.value);
++      unmarkedSlowIdentity(0);
++      return [result, arguments.length, arguments[0], arguments[1], retained];
++    }
++    function afterLeaf(value) { return freshAfterLeaf(value, value); }
++    for (const helper of [freshPlain, freshStrict, freshObject, freshAfterLeaf]) {
++      %PrepareFunctionForOptimization(helper);
++    }
++    for (const fn of [readZero, readStrictZero, readPlain, readMulti, readStrict,
++                      readObject, readLoop, afterLeaf]) {
++      %PrepareFunctionForOptimization(fn);
++      fn(freshPayload); fn(freshPayload);
++      %OptimizeMaglevOnNextCall(fn);
++      fn(freshPayload);
++    }
++  )JS");
++  for (const char* name :
++       {"readZero", "readStrictZero", "readPlain", "readMulti", "readStrict",
++        "readObject", "readLoop", "afterLeaf"}) {
++    CheckBoundedMaglev(name);
++  }
++  // Establish real inlining, rather than accepting a Maglev caller that still
++  // invokes an unoptimized helper with a materialized arguments object.
++  const char* inlined_calls[][2] = {
++      {"readZero", "freshPlain"},    {"readStrictZero", "freshStrict"},
++      {"readPlain", "freshPlain"},   {"readMulti", "freshPlain"},
++      {"readStrict", "freshStrict"}, {"readObject", "freshObject"},
++      {"readLoop", "freshPlain"},    {"afterLeaf", "freshAfterLeaf"}};
++  for (const auto& names : inlined_calls) {
++    auto callee = BoundedTestFunction(names[1]);
++    auto data = BoundedTestFunction(names[0])
++                    ->code(CcTest::i_isolate())
++                    ->deoptimization_data();
++    bool found = false;
++    for (int i = 0; i < data->InlinedFunctionCount().value(); ++i) {
++      found |= data->GetInlinedFunction(i) == callee->shared();
++    }
++    CHECK(found);
++  }
++  bounded_i32_fast = bounded_i32_slow = 0;
++  ExpectInt32("readZero()", 0);
++  ExpectInt32("readStrictZero()", 0);
++  ExpectInt32("readPlain()", 32);
++  ExpectInt32("readMulti()", 34);
++  ExpectInt32("readStrict()", 33);
++  ExpectInt32("readObject(freshPayload)", 31);
++  ExpectInt32("readLoop()", 128);
++  CHECK_EQ(8, bounded_i32_fast);
++  CHECK_EQ(0, bounded_i32_slow);
++
++  // The ordinary callback can GC and invalidate the active caller. The
++  // rematerialized arguments must retain both aliases and execute the leaf
++  // once.
++  bounded_i32_fast = bounded_i32_slow = 0;
++  unmarked_i32_fast = unmarked_i32_slow = 0;
++  unmarked_gc = unmarked_deopt = true;
++  ExpectTrue(R"JS(
++    (() => {
++      const result = afterLeaf(freshPayload);
++      return result[0] === 31 && result[1] === 2 &&
++             result[2] === freshPayload && result[3] === freshPayload &&
++             result[4] === freshPayload;
++    })()
++  )JS");
++  CHECK_EQ(1, bounded_i32_fast);
++  CHECK_EQ(0, bounded_i32_slow);
++  CHECK_EQ(1, unmarked_i32_slow);
++  CHECK_EQ(0, unmarked_i32_fast);
++  ExpectFalse("%ActiveTierIsMaglev(afterLeaf)");
++  unmarked_gc = unmarked_deopt = false;
++#endif
++}
++
++TEST(MaglevFreshArgumentsReadOnlyInvalidation) {
++#if defined(V8_ENABLE_MAGLEV) && defined(V8_TARGET_ARCH_X64) && V8_OS_LINUX && \
++    !defined(USE_SIMULATOR)
++  if (i::v8_flags.jitless || i::v8_flags.disable_optimizing_compilers) return;
++  BoundedNativeMaglevTest flags;
++  i::FlagScope<bool> tracking(&i::v8_flags.maglev_object_tracking, false);
++  i::FlagScope<bool> escape(&i::v8_flags.maglev_escape_analysis, true);
++  i::FlagScope<int> inline_size(&i::v8_flags.max_maglev_inlined_bytecode_size,
++                                300);
++  v8::HandleScope scope(CcTest::isolate());
++  LocalContext env;
++  flags.Install(env.local(), true);
++  CompileRun(R"JS(
++    function writeArgs() {
++      const before = arguments[0];
++      arguments[0] = 17; arguments.length = 3;
++      return before * 1000 + arguments[0] * 10 + arguments.length;
++    }
++    function aliasArgs() {
++      const alias = arguments;
++      alias[0] = 17;
++      return arguments[0];
++    }
++    function mutateArgs(value) { value[0] = 17; value.length = 2; }
++    %NeverOptimizeFunction(mutateArgs);
++    function parentArgs() {
++      const parent = { value: arguments };
++      mutateArgs(parent.value);
++      return arguments[0] * 10 + arguments.length;
++    }
++    function mappedArgs(value) {
++      value = 17;
++      const before = arguments[0];
++      arguments[0] = 23;
++      return before * 100 + value;
++    }
++    function mappedContextArgs(value) {
++      (() => { value = 19; })();
++      const before = arguments[0];
++      arguments[0] = 23;
++      return before * 100 + value;
++    }
++    function deletedArgs() {
++      delete arguments[0];
++      return arguments.length === 1 && arguments[0] === undefined;
++    }
++    function definedArgs() {
++      Object.defineProperty(arguments, '0', { value: 23 });
++      Object.defineProperty(arguments, 'length', { value: 2 });
++      return arguments[0] * 10 + arguments.length;
++    }
++    function crossLoopArgs() {
++      const args = arguments;
++      let total = 0;
++      for (let i = 0; i < 3; ++i) {
++        total += args[0];
++        args[0]++;
++      }
++      return total;
++    }
++    function arrayChanges(value) {
++      const array = [value, value + 1, value + 2];
++      const before = array[0];
++      array.length = 1;
++      array.push(value + 7);
++      return before + array[0] + array[1] + array.length;
++    }
++    function writeDriver() { return writeArgs(31); }
++    function aliasDriver() { return aliasArgs(31); }
++    function parentDriver() { return parentArgs(31); }
++    function mappedDriver() { return mappedArgs(31); }
++    function contextDriver() { return mappedContextArgs(31); }
++    function deletedDriver() { return deletedArgs(31); }
++    function definedDriver() { return definedArgs(31); }
++    function crossLoopDriver() { return crossLoopArgs(31); }
++    function arrayDriver() { return arrayChanges(31); }
++    var invalidationObject = { value: 31 }, invalidationWrites = 0;
++    function catchArgs() {
++      'use strict';
++      const result = boundedIdentity(31);
++      try {
++        arguments[0] = 17; arguments.length = 2;
++        invalidationWrites++;
++        unmarkedSlowIdentity(0);
++        throw invalidationObject;
++      } catch (error) {
++        return [result, arguments[0], arguments.length,
++                arguments[1], error === invalidationObject];
++      }
++    }
++    function afterLeaf() {
++      return catchArgs(invalidationObject, invalidationObject);
++    }
++    for (const helper of [writeArgs, aliasArgs, parentArgs, mappedArgs,
++                          mappedContextArgs, deletedArgs, definedArgs,
++                          crossLoopArgs, arrayChanges, catchArgs]) {
++      %PrepareFunctionForOptimization(helper);
++    }
++    for (const fn of [writeDriver, aliasDriver, parentDriver, mappedDriver,
++                      contextDriver, deletedDriver, definedDriver,
++                      crossLoopDriver, arrayDriver, afterLeaf]) {
++      %PrepareFunctionForOptimization(fn);
++      fn(); fn();
++      %OptimizeMaglevOnNextCall(fn);
++      fn();
++    }
++  )JS");
++  for (const char* name :
++       {"writeDriver", "aliasDriver", "parentDriver", "mappedDriver",
++        "contextDriver", "deletedDriver", "definedDriver", "crossLoopDriver",
++        "arrayDriver", "afterLeaf"}) {
++    CheckBoundedMaglev(name);
++  }
++  const char* inlined_calls[][2] = {{"writeDriver", "writeArgs"},
++                                    {"aliasDriver", "aliasArgs"},
++                                    {"parentDriver", "parentArgs"},
++                                    {"mappedDriver", "mappedArgs"},
++                                    {"contextDriver", "mappedContextArgs"},
++                                    {"deletedDriver", "deletedArgs"},
++                                    {"definedDriver", "definedArgs"},
++                                    {"crossLoopDriver", "crossLoopArgs"},
++                                    {"arrayDriver", "arrayChanges"},
++                                    {"afterLeaf", "catchArgs"}};
++  for (const auto& names : inlined_calls) {
++    auto callee = BoundedTestFunction(names[1]);
++    auto data = BoundedTestFunction(names[0])
++                    ->code(CcTest::i_isolate())
++                    ->deoptimization_data();
++    bool found = false;
++    for (int i = 0; i < data->InlinedFunctionCount().value(); ++i) {
++      found |= data->GetInlinedFunction(i) == callee->shared();
++    }
++    CHECK(found);
++  }
++  ExpectInt32("writeDriver()", 31173);
++  ExpectInt32("aliasDriver()", 17);
++  ExpectInt32("parentDriver()", 172);
++  ExpectInt32("mappedDriver()", 1723);
++  ExpectInt32("contextDriver()", 1923);
++  ExpectTrue("deletedDriver()");
++  ExpectInt32("definedDriver()", 232);
++  ExpectInt32("crossLoopDriver()", 96);
++  ExpectInt32("arrayDriver()", 102);
++  bounded_i32_fast = bounded_i32_slow = 0;
++  unmarked_i32_fast = unmarked_i32_slow = 0;
++  unmarked_gc = unmarked_deopt = true;
++  ExpectTrue(R"JS(
++    (() => {
++      invalidationWrites = 0;
++      const result = afterLeaf();
++      return result[0] === 31 && result[1] === 17 && result[2] === 2 &&
++             result[3] === invalidationObject && result[4] &&
++             invalidationWrites === 1;
++    })()
++  )JS");
++  CHECK_EQ(1, bounded_i32_fast);
++  CHECK_EQ(0, bounded_i32_slow);
++  CHECK_EQ(1, unmarked_i32_slow);
++  CHECK_EQ(0, unmarked_i32_fast);
++  ExpectFalse("%ActiveTierIsMaglev(afterLeaf)");
++  unmarked_gc = unmarked_deopt = false;
 +#endif
 +}
 +
